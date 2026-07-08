@@ -1,0 +1,269 @@
+# ============================================================
+# AI 测试用例生成系统 - 全局配置
+# ============================================================
+#
+# 【重要】本文件不含任何敏感信息 (API key 等)
+# API key 只能从环境变量 ANTHROPIC_API_KEY 读取
+# ============================================================
+
+# 项目元信息
+project:
+  name: yiye-agent
+  version: "0.1.0"
+  description: "一叶项目 AI 测试用例生成系统"
+
+# ============================================================
+# LLM 配置 (MiniMax via Anthropic 协议)
+# ============================================================
+llm:
+  # Anthropic SDK 兼容端点 (MiniMax 提供)
+  base_url: "https://api.minimaxi.com/anthropic"
+
+  # API key 环境变量名 (不要在代码里写死 key)
+  api_key_env: "ANTHROPIC_API_KEY"
+
+  # 主模型 - MiniMax-M3 (1M 上下文, Agent 优化, 最新)
+  # 适用: PRD 提炼, 代码分析, 工具调用, 长上下文
+  model: "MiniMax-M3"
+
+  # 备选模型 (按需切换, 在 config.local.yaml 覆盖)
+  # - "MiniMax-M2.7-highspeed" : 100 TPS, 快速
+  # - "MiniMax-M2"             : 编码 + Agent
+  fallback_models:
+    - "MiniMax-M2.7-highspeed"
+    - "MiniMax-M2"
+
+  # 默认调用参数
+  defaults:
+    max_tokens: 4096
+    temperature: 1.0       # MiniMax 文档推荐 1.0
+    thinking: "disabled"   # MVP 关闭, 后期可改 "adaptive"
+
+  # 单次调用超时 (秒)
+  timeout: 180
+
+  # 重试配置
+  retry:
+    max_attempts: 3
+    backoff_factor: 2      # 指数退避基数 (秒)
+
+# ============================================================
+# 路径配置
+# ============================================================
+paths:
+  # 工作区根目录 (所有运行时产物)
+  workspaces: "./runs"
+
+  # Prompt 模板目录
+  prompts: "./prompts"
+
+  # 日志目录
+  logs: "./.logs"
+
+  # 状态/索引目录 (知识库运行时数据)
+  state: "./.state"
+
+  # 配置目录
+  config_dir: "./.config"
+
+  # UI 资源目录 (前端构建产物)
+  ui_dist: "./ui/dist"
+
+# ============================================================
+# Stage 1 配置 (PRD 提炼与缺口识别)
+# ============================================================
+stage1:
+  # 是否启用缺口识别
+  enable_gap_analysis: true
+
+  # 段落切分阈值 (字符数)
+  segment_max_chars: 8000
+
+  # 输出格式
+  output_formats:
+    - "json"      # 机器可读
+    - "markdown"  # 人类可读报告
+
+  # 缺口严重度阈值 (只展示 severity >= 此值)
+  gap_severity_threshold: "low"
+
+# ============================================================
+# Stage 2 配置 (代码知识库)
+# ============================================================
+stage2:
+  # 代码切分配置
+  chunk_size: 2000         # 每个 chunk 的 token 上限
+  chunk_overlap: 200       # 相邻 chunk 重叠 token
+
+  # 调用链扩展深度
+  impact_analysis:
+    upstream_depth: 3      # 向上找 caller
+    downstream_depth: 2    # 向下找 callee
+    max_chunks: 500        # 总数上限
+
+  # 是否启用 AST 索引
+  enable_ast_indexing: true
+
+  # 是否启用倒排索引 (FTS5)
+  enable_inverted_index: true
+
+  # 是否启用向量索引 (Phase 2 再开)
+  enable_vector_index: false
+
+# ============================================================
+# Stage 3 配置 (需求-代码关联)
+# ============================================================
+stage3:
+  # 多路召回数量
+  recall:
+    symbol_top_k: 20       # 符号检索返回数
+    inverted_top_k: 30     # 倒排检索返回数
+    tag_top_k: 20          # 标签检索返回数
+
+  # LLM 重排序候选数
+  rerank_candidates: 30
+
+  # 最终关联数 (高置信度)
+  final_top_k: 20
+
+# ============================================================
+# Stage 4 配置 (边界值与场景推导)
+# ============================================================
+stage4:
+  # 每个需求生成的场景数
+  target_scenarios: 25
+
+  # 场景优先级分布
+  priority_distribution:
+    P0: 0.5    # 50% 核心场景
+    P1: 0.3    # 30% 重要场景
+    P2: 0.2    # 20% 边缘场景
+
+  # 场景类型
+  scenario_types:
+    - happy_path     # 正常流程
+    - boundary       # 边界值
+    - exception      # 异常流程
+    - permission     # 权限相关
+    - compatibility  # 兼容性
+    - performance    # 性能
+
+# ============================================================
+# Stage 5 配置 (用例生成)
+# ============================================================
+stage5:
+  # 每个场景生成的用例数 (通常 1:1)
+  cases_per_scenario: 1
+
+  # 并发 LLM 调用数
+  concurrency: 5
+
+  # 输出格式
+  output_formats:
+    - "yaml"       # 人类可读
+    - "json"       # 机器可读
+    - "gherkin"    # BDD 格式
+    - "pytest"     # 可执行 Python 测试
+
+  # 用例状态机
+  states:
+    - "generated"  # AI 生成, 未审核
+    - "approved"   # QA 审核通过
+    - "executed"   # 已执行
+
+# ============================================================
+# 可观测 UI 配置
+# ============================================================
+ui:
+  enabled: true
+
+  # Web UI 服务端口
+  port: 18888
+
+  # 实时推送协议: sse (Server-Sent Events)
+  realtime_protocol: "sse"
+
+  # 状态推送间隔 (毫秒)
+  push_interval_ms: 1000
+
+# ============================================================
+# 日志配置
+# ============================================================
+logging:
+  level: "INFO"            # DEBUG / INFO / WARNING / ERROR
+
+  # 控制台输出
+  console:
+    enabled: true
+    format: "simple"       # simple / json
+
+  # 文件输出
+  file:
+    enabled: true
+    format: "json"         # 始终 JSON, 便于检索
+    rotation: "daily"      # daily / size
+    max_files: 30          # 保留最近 N 个日志文件
+
+  # 审计日志 (所有写操作)
+  audit:
+    enabled: true
+    path: "./.logs/audit"
+
+# ============================================================
+# Token 安全配置
+# ============================================================
+security:
+  # 日志中 token 显示规则 (前 8 位 + 长度, 永远不全量输出)
+  token_display:
+    show_full: false
+    show_prefix_chars: 8
+
+  # 禁止 echo 的字段
+  redact_fields:
+    - "api_key"
+    - "token"
+    - "password"
+    - "secret"
+    - "authorization"
+
+# ============================================================
+# 性能与成本
+# ============================================================
+performance:
+  # LLM 调用并发数
+  llm_concurrency: 5
+
+  # 索引构建并行 worker 数 (默认 = CPU 核数)
+  index_workers: 0         # 0 = auto
+
+  # 缓存配置
+  cache:
+    enabled: true
+    ttl_seconds: 3600      # 1 小时
+    max_size_mb: 100
+
+# ============================================================
+# 召回策略 (多路召回)
+# ============================================================
+recall:
+  # 是否启用跨域检索
+  enable_cross_domain: true
+
+  # 是否启用隐式调用识别 (反射/AOP/Event 等)
+  enable_implicit_calls: false  # Phase 1 暂不开
+
+  # 是否启用 LLM 语义补全
+  enable_llm_completion: true
+
+  # LLM 补全候选数
+  completion_candidates: 20
+
+# ============================================================
+# 调试
+# ============================================================
+debug:
+  # 是否保存 LLM 原始响应 (包含 token 等敏感数据)
+  save_raw_responses: false
+
+  # 抽样率 (0.0 - 1.0, 1.0 = 全部抽样)
+  sample_rate: 0.0

@@ -1,0 +1,437 @@
+# ============================================================
+# 一叶项目 - 知识库配置
+# ============================================================
+#
+# 定义知识库包含哪些业务域, 每个域包含哪些代码源
+# ============================================================
+
+version: "0.1.0"
+project: yiye-agent
+description: "一叶智能营销平台 - AI 测试用例生成系统"
+
+# ============================================================
+# 业务域定义
+# ============================================================
+domains:
+  # ----------------------------------------------------------
+  # landing-page - 落地页域
+  # ----------------------------------------------------------
+  landing-page:
+    description: "落地页域 (创建, 编辑, 发布, 访问, 追踪)"
+    business_tags:
+      - 落地页
+      - 编辑器
+      - 表单
+      - 追踪
+      - 预览
+
+    code_sources:
+      # 后端微服务
+      - id: lp-service
+        type: backend
+        language: java
+        framework: spring-boot
+        path: "D:/code/yiye-agent-backend/yiye-agent-private/yiye-agent-landing-page-service-private"
+
+      - id: lp-show
+        type: backend
+        language: java
+        framework: spring-boot
+        path: "D:/code/yiye-agent-backend/yiye-agent-private/yiye-agent-landing-page-show-service-private"
+
+      - id: lp-action
+        type: backend
+        language: java
+        framework: spring-boot
+        path: "D:/code/yiye-agent-backend/yiye-agent-private/yiye-agent-landing-page-action-service-private"
+
+      # 前端 - 后台管理 (landing-page 相关页面)
+      - id: lp-frontend-main
+        type: frontend
+        language: vue
+        path: "D:/code/yiye-agent-frontend/yiye-private/src/views/landing-page"
+
+      # 前端 - 独立编辑器 (整个项目归本域)
+      - id: lp-frontend-editor
+        type: frontend
+        language: vue
+        path: "D:/code/yiye-landingpage-editor"
+
+  # ----------------------------------------------------------
+  # marketing - 营销域 (最大)
+  # ----------------------------------------------------------
+  marketing:
+    description: "营销域 (活动, 客户, 广告主, 数据统计)"
+    business_tags:
+      - 营销
+      - 活动
+      - 客户
+      - 广告主
+      - 统计
+      - 报表
+
+    code_sources:
+      - id: mkt-service
+        type: backend
+        language: java
+        framework: spring-boot
+        path: "D:/code/yiye-agent-backend/yiye-agent-private/yiye-agent-marketing-service-private"
+
+      - id: mkt-data-collect
+        type: backend
+        language: java
+        framework: spring-boot
+        path: "D:/code/yiye-agent-backend/yiye-agent-private/yiye-agent-marketing-data-collect-service-private"
+
+      - id: mkt-data-statistics
+        type: backend
+        language: java
+        framework: spring-boot
+        path: "D:/code/yiye-agent-backend/yiye-agent-private/yiye-agent-marketing-data-statistics-service-private"
+
+      - id: mkt-data-store
+        type: backend
+        language: java
+        framework: spring-boot
+        path: "D:/code/yiye-agent-backend/yiye-agent-private/yiye-agent-marketing-data-store-service-private"
+
+      - id: mkt-data-stream
+        type: backend
+        language: java
+        framework: spring-boot
+        path: "D:/code/yiye-agent-backend/yiye-agent-private/yiye-agent-marketing-data-stream-service-private"
+
+      - id: mkt-material-store
+        type: backend
+        language: java
+        framework: spring-boot
+        path: "D:/code/yiye-agent-backend/yiye-agent-private/yiye-agent-marketing-material-store-service-private"
+
+  # ----------------------------------------------------------
+  # ucenter - 用户中心域
+  # ----------------------------------------------------------
+  ucenter:
+    description: "用户中心域 (注册, 登录, 会话)"
+    business_tags:
+      - 用户
+      - 登录
+      - 注册
+      - 会话
+
+    code_sources:
+      - id: uc-service
+        type: backend
+        language: java
+        framework: spring-boot
+        path: "D:/code/yiye-agent-backend/yiye-agent-private/yiye-agent-ucenter-service-private"
+
+      - id: uc-frontend-login
+        type: frontend
+        language: vue
+        path: "D:/code/yiye-agent-frontend/yiye-private/src/views/login"
+
+  # ----------------------------------------------------------
+  # customer-service - 客服域 (新模块重点)
+  # ----------------------------------------------------------
+  customer-service:
+    description: "客服域 (客服账号 / 客服系统 / 获客助手 / 客服操作记录 / Boss 客服管理)"
+    business_tags:
+      - 客服
+      - 客服账号
+      - 客服状态
+      - 获客助手
+      - 客服操作记录
+      - Boss客服
+
+    code_sources:
+      # 客服主服务
+      - id: cs-service
+        type: backend
+        language: java
+        framework: spring-boot
+        path: "D:/code/yiye-agent-backend/yiye-agent-private/yiye-agent-customer-service-private"
+
+      # Boss 后台 - 客服管理 / AgentStatusEnum / BossCustomer
+      - id: cs-boss-backend
+        type: backend
+        language: java
+        framework: spring-boot
+        path: "D:/code/yiye-agent-backend/yiye-agent-boss-backend"
+
+      # 自动装配 - AgentAutoConfiguration / AgentProperties
+      - id: cs-autoconfigure-agent
+        type: backend
+        language: java
+        path: "D:/code/yiye-agent-backend/yiye-agent-autoconfigure/src/main/java/ai/yiye/agent/autoconfigure/agent"
+
+      # 用户中心 - 客服账号 / 登录认证
+      - id: cs-ucenter-service
+        type: backend
+        language: java
+        framework: spring-boot
+        path: "D:/code/yiye-agent-backend/yiye-agent-private/yiye-agent-ucenter-service-private"
+
+  # ----------------------------------------------------------
+  # payment - 支付域
+  # ----------------------------------------------------------
+  payment:
+    description: "支付域 (微信/抖音/平安支付等渠道对接)"
+    business_tags:
+      - 支付
+      - 订单
+      - 退款
+      - 对账
+
+    code_sources:
+      - id: pay-service
+        type: backend
+        language: java
+        framework: spring-boot
+        path: "D:/code/yiye-agent-backend/yiye-agent-private/yiye-agent-payment-service-private"
+
+  # ----------------------------------------------------------
+  # message - 消息域
+  # ----------------------------------------------------------
+  message:
+    description: "消息域 (站内通知, 邮件, 短信, Webhook)"
+    business_tags:
+      - 通知
+      - 邮件
+      - 短信
+      - Webhook
+
+    code_sources:
+      - id: msg-service
+        type: backend
+        language: java
+        framework: spring-boot
+        path: "D:/code/yiye-agent-backend/yiye-agent-private/yiye-agent-message-service-private"
+
+      - id: msg-sms
+        type: backend
+        language: java
+        framework: spring-boot
+        path: "D:/code/yiye-agent-backend/yiye-agent-private/yiye-agent-sms-service-private"
+
+  # ----------------------------------------------------------
+  # collect - 采集域
+  # ----------------------------------------------------------
+  collect:
+    description: "采集域 (行为数据采集, 广告归因, 点击追踪)"
+    business_tags:
+      - 采集
+      - 埋点
+      - 追踪
+      - 归因
+
+    code_sources:
+      - id: collect-trace
+        type: backend
+        language: java
+        framework: spring-boot
+        path: "D:/code/yiye-agent-backend/yiye-agent-private/yiye-agent-collect-trace-service-private"
+
+      - id: collect-submit
+        type: backend
+        language: java
+        framework: spring-boot
+        path: "D:/code/yiye-agent-backend/yiye-agent-private/yiye-agent-collect-submit-service-private"
+
+      - id: collect-pageview
+        type: backend
+        language: java
+        framework: spring-boot
+        path: "D:/code/yiye-agent-backend/yiye-agent-private/yiye-agent-collect-pageview-service-private"
+
+      - id: collect-overseas
+        type: backend
+        language: java
+        framework: spring-boot
+        path: "D:/code/yiye-agent-backend/yiye-agent-private/yiye-agent-collect-overseas-service-private"
+
+      - id: ad-trace
+        type: backend
+        language: java
+        framework: spring-boot
+        path: "D:/code/yiye-agent-backend/yiye-agent-private/yiye-agent-ad-trace-service-private"
+
+  # ----------------------------------------------------------
+  # cross - 跨域公共内容 (网关, 共享 domain, 公共工具, 自动装配, SDK, 前端公共)
+  # ----------------------------------------------------------
+  cross:
+    description: "跨域公共内容 (网关, 共享 domain, 公共依赖, SDK, 前端公共)"
+
+    code_sources:
+      # 网关 (所有请求入口)
+      - id: gateway
+        type: backend
+        language: java
+        framework: spring-cloud-gateway
+        path: "D:/code/yiye-agent-backend/yiye-agent-private/yiye-agent-gateway-private"
+
+      # 基础 domain 模型
+      - id: domain-shared
+        type: backend
+        language: java
+        path: "D:/code/yiye-agent-backend/yiye-agent-domain"
+
+      # 公共工具
+      - id: common
+        type: backend
+        language: java
+        path: "D:/code/yiye-agent-backend/yiye-agent-common"
+
+      # 自动装配 (整个目录, 含 agent 等所有子包)
+      - id: autoconfigure
+        type: backend
+        language: java
+        path: "D:/code/yiye-agent-backend/yiye-agent-autoconfigure"
+
+      # Boss 后台 (跨域共享 - 含 BossCustomer / AgentStatusEnum / BossCustomerController)
+      - id: boss-backend
+        type: backend
+        language: java
+        framework: spring-boot
+        path: "D:/code/yiye-agent-backend/yiye-agent-boss-backend"
+
+      # 数据库服务
+      - id: db-server
+        type: backend
+        language: java
+        path: "D:/code/yiye-agent-backend/yiye-agent-db-server"
+
+      # 开放平台
+      - id: open-platform
+        type: backend
+        language: java
+        path: "D:/code/yiye-agent-backend/yiye-agent-open-platform"
+
+      # 外部对接 SDK
+      - id: marketing-sdk
+        type: backend
+        language: java
+        path: "D:/code/yiye-agent-backend/yiye-agent-marketing-sdk"
+
+      - id: weixin-sdk
+        type: backend
+        language: java
+        path: "D:/code/yiye-agent-backend/yiye-agent-weixin-sdk"
+
+      - id: douyin-sdk
+        type: backend
+        language: java
+        path: "D:/code/yiye-agent-backend/yiye-agent-douyin-sdk"
+
+      - id: pdd-util-server
+        type: backend
+        language: java
+        path: "D:/code/yiye-agent-backend/yiye-agent-pdd-util-server"
+
+      - id: taoke-util-server
+        type: backend
+        language: java
+        path: "D:/code/yiye-agent-backend/yiye-agent-taoke-util-server"
+
+      # 前端公共部分
+      - id: fe-api
+        type: frontend
+        language: vue
+        path: "D:/code/yiye-agent-frontend/yiye-private/src/api"
+
+      - id: fe-components
+        type: frontend
+        language: vue
+        path: "D:/code/yiye-agent-frontend/yiye-private/src/components"
+
+      - id: fe-yiye-ui
+        type: frontend
+        language: vue
+        path: "D:/code/yiye-agent-frontend/yiye-private/packages/yiye-ui"
+
+      - id: fe-router
+        type: frontend
+        language: vue
+        path: "D:/code/yiye-agent-frontend/yiye-private/src/router"
+
+      - id: fe-utils
+        type: frontend
+        language: vue
+        path: "D:/code/yiye-agent-frontend/yiye-private/src/utils"
+
+      - id: fe-permission
+        type: frontend
+        language: vue
+        path: "D:/code/yiye-agent-frontend/yiye-private/src/permission"
+
+      - id: fe-hooks
+        type: frontend
+        language: vue
+        path: "D:/code/yiye-agent-frontend/yiye-private/src/hooks"
+
+      - id: fe-mixins
+        type: frontend
+        language: vue
+        path: "D:/code/yiye-agent-frontend/yiye-private/src/mixins"
+
+      - id: fe-pages
+        type: frontend
+        language: vue
+        path: "D:/code/yiye-agent-frontend/yiye-private/src/pages"
+
+      - id: fe-layout
+        type: frontend
+        language: vue
+        path: "D:/code/yiye-agent-frontend/yiye-private/src/layout"
+
+# ============================================================
+# 排除规则 (不进入知识库的路径)
+# ============================================================
+excludes:
+  # 通用排除
+  patterns:
+    - "**/node_modules/**"
+    - "**/target/**"
+    - "**/build/**"
+    - "**/dist/**"
+    - "**/.git/**"
+    - "**/__pycache__/**"
+    - "**/.idea/**"
+    - "**/.vscode/**"
+    - "**/test/**"
+    - "**/tests/**"
+    - "**/*.test.java"
+    - "**/*.spec.java"
+
+  # 文件大小限制 (字节)
+  max_file_size: 1048576  # 1MB
+
+  # 二进制文件
+  binary_extensions:
+    - ".class"
+    - ".jar"
+    - ".war"
+    - ".png"
+    - ".jpg"
+    - ".jpeg"
+    - ".gif"
+    - ".ico"
+    - ".pdf"
+    - ".zip"
+    - ".tar"
+    - ".gz"
+
+# ============================================================
+# 增量更新配置
+# ============================================================
+incremental:
+  # Git hook 触发
+  git_hook:
+    enabled: true
+    events:
+      - "post-commit"
+      - "post-merge"
+
+  # 定时全量重建 (兜底)
+  scheduled_rebuild:
+    enabled: false  # 初期关闭
+    cron: "0 2 * * 0"  # 每周日凌晨 2 点
