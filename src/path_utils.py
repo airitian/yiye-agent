@@ -4,14 +4,20 @@ Path utilities - 跨平台 glob 匹配等共用函数.
 v0.5.9: 把 deep_audit.py + kb_build.py 各自维护的 _glob_match 提取到一处.
 fnmatch 在 Windows 路径语义下不匹配 \\ 分隔符, ** 必须有前导分隔符才拆开.
 本模块统一处理这些跨平台坑.
+
+v0.5.10: 加 secure_file() 跨平台文件权限收紧工具 (P0-5 fix).
 """
 
 import fnmatch
+import os
 import re
+import sys
+from pathlib import Path
 
 
 def glob_match(path: str, pattern: str) -> bool:
-    """跨平台 glob 匹配 (Windows / POSIX 都对).
+    """
+    跨平台 glob 匹配 (Windows / POSIX 都对).
 
     参数:
         path:   文件相对路径 (跨平台可能含 \\ 或 /)
@@ -44,3 +50,39 @@ def glob_match(path: str, pattern: str) -> bool:
 def _glob_match(path: str, pattern: str) -> bool:
     """DEPRECATED: 请用 glob_match. 保留仅用于向后兼容."""
     return glob_match(path, pattern)
+
+
+def secure_file(path, mode: int = 0o600) -> bool:
+    """
+    收紧文件权限, 防止其他用户读取敏感文件 (.env, 审计日志等).
+
+    P0-5 fix: 之前 .env / .logs/audit/*.jsonl 默认 644 (其他用户可读),
+    共享主机场景下任何用户能 cat 出 API key / 审计数据.
+
+    跨平台行为:
+    - POSIX (Linux/Mac): 真实生效, 0o600 = owner read+write only.
+    - Windows: NTFS 走 ACL 不走 POSIX mode bit, os.chmod 是只读接口;
+      调 chmod 不报错也不生效. Windows 上保持原权限 (已经是 NTFS 默认 ACL),
+      不抛异常. 共享 Windows 场景的真正防护靠 NTFS ACL 设置.
+
+    Args:
+        path: 文件路径 (str / Path / None)
+        mode: 目标权限位 (默认 0o600 = owner only)
+
+    Returns:
+        True  = 收紧成功 (POSIX) 或 跳过 (Windows)
+        False = 失败 (文件不存在 / 权限不足 / 平台不支持)
+    """
+    if path is None:
+        return False
+    try:
+        p = Path(path)
+        if not p.exists():
+            return False
+        if sys.platform == "win32":
+            # NTFS: 走 ACL, 我们的 Python 工具无能为力; 显式跳过不抛异常
+            return True
+        os.chmod(str(p), mode)
+        return True
+    except (OSError, PermissionError):
+        return False

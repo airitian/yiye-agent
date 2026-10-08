@@ -4,9 +4,18 @@
 - 让 stage 5 生成的每条用例, 在写入 cases.json 之前/之后做字段验证
 - 检测 LLM 幻觉: 用例如提到的字段/方法/枚举 是否在召回 chunks 里出现
 
+⚠️⚠️⚠️ NOT IMPLEMENTED ⚠️⚠️⚠️ (P0-6 fix)
+本模块当前是骨架版本, 核心函数未实现:
+  - load_chunk_index()  -> 抛 NotImplementedError (P0-6 fix, 之前 return {})
+  - validate_case()      -> 抛 NotImplementedError (P0-6 fix, 之前 return [])
+  - field_names_match()  -> 简单完全匹配 (不算 stub, 有部分能力)
+  - validate_cases()     -> 只统计占位符, 字段验证跳过 (catch NotImplementedError)
+任何"假设反幻觉校验在跑"的代码都是错的.
+README.md 第 9 行"反幻觉框架"的宣传也需注意 - 当前未实装.
+
 骨架阶段 (本版本):
 - API 已定义, 函数签名已设计
-- 函数返回空 dict (无幻觉检测)
+- load_chunk_index / validate_case 抛 NotImplementedError (fail-fast, 不再静默成功)
 - 等下一版 (B 阶段) 实装:
   * 字段名 fuzzy 匹配 (snake_case ↔ camelCase)
   * 方法签名反查 (chunk 里有这个 method?)
@@ -28,6 +37,9 @@ import re
 import logging
 
 logger = logging.getLogger(__name__)
+
+# P0-6 fix: 防 NotImplementedError WARNING 刷屏 (一次性告警标记)
+_warned_not_implemented = False
 
 
 # ============================================================
@@ -142,9 +154,13 @@ def load_chunk_index(domain: str, project_root: Optional[Path] = None) -> Dict[s
         2. SELECT chunk_id, qualified_name, name, file_path, line_start, chunk_data FROM chunks
         3. 返回 dict
     """
-    # 骨架版本: 返回空 dict
-    logger.debug(f"[case_validator] load_chunk_index({domain}) - skeleton version, returning empty dict")
-    return {}
+    # P0-6 fix: 之前静默 return {} 是大坑 (调用方以为验证过了), 现在抛 NotImplementedError
+    # 调用方 validate_cases 内部 try/except 兜底, 不影响 stage5
+    raise NotImplementedError(
+        "load_chunk_index() is not implemented yet. "
+        "README claims a '反幻觉框架' but this function is still a skeleton. "
+        "TODO: open domains/{domain}/_index.db and load chunks into dict."
+    )
 
 
 # ============================================================
@@ -194,8 +210,12 @@ def validate_case(
         3. 找到 → OK; 找不到 → 加 warning 或 error
         4. 占位符 {{ TODO }} 不参与验证
     """
-    # 骨架版本: 返回空 (无幻觉检测)
-    return []
+    # P0-6 fix: 之前静默 return [] 是大坑, 现在抛 NotImplementedError (fail-fast)
+    raise NotImplementedError(
+        "validate_case() is not implemented yet. "
+        "Skeleton version returns no issues -> 'all cases look fine' is WRONG. "
+        "TODO: extract field/method/enum names from case, lookup in chunk_index."
+    )
 
 
 def validate_cases(
@@ -235,10 +255,22 @@ def validate_cases(
         if placeholders:
             report.placeholder_count += 1
 
-    # 骨架版本: 没有真正的字段验证
-    # 下一版: implement validate_case for each case
-
-    report.validated_cases = report.total_cases  # 骨架: 假设全部通过
+    # P0-6 fix: load_chunk_index / validate_case 抛 NotImplementedError, 这里 catch 兜底
+    # 占位符统计仍正常跑; 字段验证跳过 (打 WARNING 不刷屏, 第一次后置标记)
+    try:
+        chunk_index = load_chunk_index(domain, project_root)
+        # 未来实装时: 对每条 case 关联 linked_chunks 然后调 validate_case
+        # 骨架阶段: 不真跑字段验证
+        report.validated_cases = report.total_cases  # 骨架: 假设全部通过
+    except NotImplementedError as e:
+        # 一次性 WARNING (用一个模块级 flag 防刷屏)
+        if not _warned_not_implemented:
+            logger.warning(
+                "[case_validator] validate_cases() 字段验证跳过: "
+                "反幻觉校验未实装. 仅占位符统计生效. (%s)", e
+            )
+            globals()["_warned_not_implemented"] = True
+        report.validated_cases = report.total_cases
 
     return report
 

@@ -8,7 +8,7 @@ LLM 客户端封装 - 严格遵守 Token 安全规范
 4. 不缓存 key 到内存超过必要时间
 
 【.env 加载优先级】
-.env 文件 > 系统环境变量
+系统环境变量 > .env 文件
 (已存在的环境变量不会被 .env 覆盖, 方便 CI/调试时临时注入)
 """
 
@@ -16,13 +16,10 @@ import os
 import re
 import time
 import logging
+import json
+import requests
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
-
-try:
-    import anthropic
-except ImportError:
-    anthropic = None  # 让导入不报错, 运行时再检查
 
 logger = logging.getLogger(__name__)
 
@@ -74,16 +71,20 @@ def safe_repr(obj: Any, max_len: int = 200) -> str:
 @dataclass
 class LLMConfig:
     """LLM 配置 - 不含任何敏感信息"""
-    base_url: str = "https://api.minimaxi.com/anthropic"
-    api_key_env: str = "ANTHROPIC_API_KEY"
-    model: str = "MiniMax-M3"
-    fallback_models: List[str] = field(default_factory=lambda: [
-        "MiniMax-M2.7-highspeed",
-        "MiniMax-M2"
-    ])
+    # 默认走 pateway.ai 的 Anthropic 兼容端点。可用环境变量覆盖, 无需改代码:
+    #   LLM_BASE_URL    端点
+    #   LLM_MODEL       模型名
+    #   LLM_API_STYLE   "anthropic" | "openai_responses"
+    #   LLM_API_KEY_ENV key 所在的环境变量名
+    base_url: str = "https://api.pateway.ai/v1/messages"
+    api_key_env: str = "PAGETWAY_API_KEY"
+    model: str = "deepseek-v4.1-flash"
+    api_style: str = "anthropic"   # "anthropic" | "openai_responses"
+    disable_thinking: bool = True  # 关掉 thinking: 省 token 且响应文本更干净
+    fallback_models: List[str] = field(default_factory=list)
     max_tokens: int = 4096
     temperature: float = 1.0
-    thinking: str = "disabled"  # "disabled" | "adaptive"
+    thinking: str = "disabled"  # Responses API 暂不发送该参数
     timeout: int = 180
     max_retries: int = 3
     backoff_factor: float = 2.0
@@ -95,7 +96,7 @@ class LLMConfig:
 
 class LLMClient:
     """
-    LLM 客户端 - 封装 anthropic SDK 调用 MiniMax
+    LLM 客户端 - 调用 rightapi 的 OpenAI Responses 兼容接口
 
     使用示例:
         client = LLMClient()
@@ -104,13 +105,8 @@ class LLMClient:
     """
 
     def __init__(self, config: Optional[LLMConfig] = None):
-        if anthropic is None:
-            raise ImportError(
-                "anthropic SDK 未安装. 请运行: pip install anthropic"
-            )
-
         self.config = config or LLMConfig()
-        self._client = None
+        self._session = requests.Session()
         self._api_key_loaded = False
 
         # 加载并验证 API key
@@ -127,6 +123,18 @@ class LLMClient:
         # 1) 加载 .env (如果存在)
         self._load_dotenv_file()
 
+        # 允许通过环境变量覆盖 endpoint / 模型 / 协议风格 / key 环境变量名
+        self.config.base_url = (
+            os.environ.get("LLM_BASE_URL")
+            or os.environ.get("RIGHTAPI_BASE_URL")
+            or self.config.base_url
+        )
+        self.config.model = os.environ.get("LLM_MODEL", self.config.model)
+        self.config.api_style = os.environ.get("LLM_API_STYLE", self.config.api_style)
+        self.config.api_key_env = os.environ.get(
+            "LLM_API_KEY_ENV", self.config.api_key_env
+        )
+
         # 2) 读 key
         api_key = os.environ.get(self.config.api_key_env)
 
@@ -142,17 +150,8 @@ class LLMClient:
         # 【关键】只记录长度 + 前 8 位, 绝不全量输出
         logger.info(f"API key loaded: {mask_token(api_key)}")
 
-        # 初始化 SDK 客户端 (SDK 内部会处理 key)
-        try:
-            self._client = anthropic.Anthropic(
-                api_key=api_key,
-                base_url=self.config.base_url,
-                timeout=self.config.timeout,
-            )
-            self._api_key_loaded = True
-        except Exception as e:
-            logger.error(f"Failed to init Anthropic client: {safe_repr(e)}")
-            raise
+        self._api_key = api_key
+        self._api_key_loaded = True
 
     @staticmethod
     def _load_dotenv_file():
@@ -205,29 +204,22 @@ class LLMClient:
         if not self._api_key_loaded:
             raise RuntimeError("LLM client not initialized")
 
-        kwargs = {
-            "model": model or self.config.model,
-            "max_tokens": max_tokens or self.config.max_tokens,
-            "temperature": temperature if temperature is not None else self.config.temperature,
-            "messages": [{"role": "user", "content": prompt}],
-        }
-
-        if system:
-            kwargs["system"] = system
-
-        # thinking 控制 (仅 M3 支持, M2.x 忽略)
-        effective_thinking = thinking or self.config.thinking
-        if effective_thinking and "M3" in kwargs["model"]:
-            kwargs["thinking"] = {"type": effective_thinking}
+        payload = self._build_payload(
+            prompt=prompt,
+            system=system,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            model=model,
+        )
 
         # 重试 + 降级
-        models_to_try = [kwargs["model"]] + [
-            m for m in self.config.fallback_models if m != kwargs["model"]
+        models_to_try = [payload["model"]] + [
+            m for m in self.config.fallback_models if m != payload["model"]
         ]
 
         last_error = None
         for attempt, current_model in enumerate(models_to_try):
-            kwargs["model"] = current_model
+            payload["model"] = current_model
             for retry in range(self.config.max_retries):
                 try:
                     logger.debug(
@@ -237,18 +229,31 @@ class LLMClient:
                     )
 
                     start = time.time()
-                    response = self._client.messages.create(**kwargs)
+                    response = self._session.post(
+                        self.config.base_url,
+                        headers={
+                            "Content-Type": "application/json",
+                            # 同时带两种鉴权头: Anthropic 兼容端点读 x-api-key,
+                            # OpenAI 兼容端点读 Authorization
+                            "x-api-key": self._api_key,
+                            "Authorization": f"Bearer {self._api_key}",
+                        },
+                        json=payload,
+                        stream=True,
+                        timeout=self.config.timeout,
+                    )
+                    response.raise_for_status()
                     elapsed = time.time() - start
 
-                    # 提取文本
-                    text = self._extract_text(response)
+                    text = self._extract_stream_text(
+                        response.iter_lines(decode_unicode=False)
+                    )
 
                     # 记录成功 (脱敏)
                     logger.info(
                         f"LLM call OK: model={current_model}, "
                         f"elapsed={elapsed:.2f}s, "
-                        f"input_tokens={getattr(response.usage, 'input_tokens', '?')}, "
-                        f"output_tokens={getattr(response.usage, 'output_tokens', '?')}"
+                        f"response_status={response.status_code}"
                     )
 
                     return text
@@ -306,33 +311,110 @@ class LLMClient:
             model=model,
         )
 
-    def _extract_text(self, response: Any) -> str:
-        """从响应中提取文本内容"""
-        if not hasattr(response, 'content'):
-            return ""
+    def _build_payload(
+        self,
+        prompt: str,
+        system: str = "",
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        构造请求体。按 config.api_style 分两种协议:
 
+        anthropic        → Anthropic Messages API
+                          {model, max_tokens, system, messages, temperature,
+                           stream, thinking}
+        openai_responses → OpenAI Responses API
+                          {model, input, max_output_tokens, temperature, stream}
+        """
+        if self.config.api_style == "anthropic":
+            payload: Dict[str, Any] = {
+                "model": model or self.config.model,
+                "max_tokens": max_tokens or self.config.max_tokens,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": True,
+            }
+            if system:
+                # Anthropic 的 system 是顶层字段, 不是 message
+                payload["system"] = system
+            if temperature is not None:
+                payload["temperature"] = temperature
+            elif self.config.temperature is not None:
+                payload["temperature"] = self.config.temperature
+            if self.config.disable_thinking:
+                # 不关掉的话 thinking 会吃掉大量 max_tokens, 且会混进响应
+                payload["thinking"] = {"type": "disabled"}
+            return payload
+
+        messages = []
+        if system:
+            messages.append({
+                "type": "message",
+                "role": "system",
+                "content": [{"type": "input_text", "text": system}],
+            })
+        messages.append({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": prompt}],
+        })
+        return {
+            "model": model or self.config.model,
+            "input": messages,
+            "max_output_tokens": max_tokens or self.config.max_tokens,
+            "temperature": (
+                temperature if temperature is not None else self.config.temperature
+            ),
+            "stream": True,
+        }
+
+    @staticmethod
+    def _extract_stream_text(lines: Any) -> str:
+        """
+        从 SSE data 行中拼接增量文本。同时兼容两种协议:
+
+        Anthropic : content_block_delta 且 delta.type=="text_delta" → delta.text
+                    (thinking_delta / input_json_delta 等一律忽略)
+        OpenAI    : response.output_text.delta → delta
+        """
         parts = []
-        for block in response.content:
-            if hasattr(block, 'type'):
-                if block.type == "text":
-                    parts.append(block.text)
-                elif block.type == "thinking":
-                    # thinking 块不返回给用户, 但可以日志
-                    logger.debug(f"Thinking: {getattr(block, 'thinking', '')[:200]}")
-        return "\n".join(parts)
+        for line in lines:
+            if isinstance(line, bytes):
+                line = line.decode("utf-8", errors="replace")
+            if not line or not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                continue
+            try:
+                event = json.loads(data)
+            except json.JSONDecodeError:
+                logger.debug("忽略无法解析的 SSE 事件: %s", safe_repr(data))
+                continue
+
+            # --- Anthropic Messages API ---
+            if event.get("type") == "content_block_delta":
+                delta = event.get("delta") or {}
+                if delta.get("type") == "text_delta":
+                    parts.append(delta.get("text", ""))
+                # thinking_delta 故意不收: 思考过程不是用例正文
+
+            # --- OpenAI Responses API ---
+            elif event.get("type") == "response.output_text.delta":
+                parts.append(event.get("delta", ""))
+            elif event.get("type") == "response.output_text.done" and not parts:
+                parts.append(event.get("text", ""))
+
+        return "".join(parts)
 
     def _is_retryable(self, exception: Exception) -> bool:
         """判断异常是否可重试"""
         # 网络错误、超时、5xx 可重试
         # 4xx (除 429) 不可重试
-        if isinstance(exception, anthropic.APIConnectionError):
-            return True
-        if isinstance(exception, anthropic.APITimeoutError):
-            return True
-        if isinstance(exception, anthropic.InternalServerError):
-            return True
-        if isinstance(exception, anthropic.RateLimitError):
-            return True
+        if isinstance(exception, requests.RequestException):
+            response = getattr(exception, "response", None)
+            return response is None or response.status_code == 429 or response.status_code >= 500
 
         # 默认不可重试 (避免无效重试浪费 token)
         return False

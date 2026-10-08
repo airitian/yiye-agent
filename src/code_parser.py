@@ -1,7 +1,7 @@
 """
 代码解析器 - Tree-sitter 集成
 
-支持 Java 和 Vue (JavaScript) 代码的 AST 解析与 chunk 切分
+支持 Java、Vue、JavaScript/TypeScript 及配置文件的解析与 chunk 切分
 """
 
 import os
@@ -96,27 +96,57 @@ class JavaParser:
         tree = self.parser.parse(bytes(content, "utf-8"))
         chunks = []
 
-        # 顶层: 找 class_declaration
+        # 顶层类型: class / interface / enum / annotation
         for node in tree.root_node.children:
-            if node.type == "class_declaration":
-                class_chunks = self._parse_class(node, content, file_path)
-                chunks.extend(class_chunks)
+            if node.type in {
+                "class_declaration",
+                "interface_declaration",
+                "enum_declaration",
+                "annotation_type_declaration",
+            }:
+                chunks.extend(self._parse_type(node, content, file_path))
+
+        # 被整文件注释、空文件或语法不完整的源码仍需进入知识库，
+        # 否则扫描数量与索引数量不一致，检索时会静默漏掉文件。
+        if not chunks:
+            import hashlib
+            digest = hashlib.md5(str(file_path).encode()).hexdigest()[:8]
+            chunks.append(CodeChunk(
+                chunk_id=f"{digest}-java_source:{file_path.stem}",
+                file_path=str(file_path),
+                file_type="java",
+                language="java",
+                chunk_type="java_source",
+                name=file_path.name,
+                line_start=1,
+                line_end=content.count("\n") + 1,
+                code_content=content,
+            ))
 
         return chunks
 
-    def _parse_class(
+    def _parse_type(
         self, class_node, content: str, file_path: Path
     ) -> List[CodeChunk]:
-        """解析 class 内部"""
+        """解析 Java 顶层类型及其方法。"""
         chunks = []
         class_name = self._get_class_name(class_node, content)
+        type_name = {
+            "class_declaration": "class",
+            "interface_declaration": "interface",
+            "enum_declaration": "enum",
+            "annotation_type_declaration": "annotation",
+        }.get(class_node.type, "java_type")
 
         # 提取类注解
         class_annotations = self._extract_annotations(class_node, content)
 
         # 遍历 class_body
         for child in class_node.children:
-            if child.type == "class_body":
+            if child.type in (
+                "class_body", "interface_body", "enum_body",
+                "annotation_type_body",
+            ):
                 for member in child.children:
                     if member.type == "method_declaration":
                         chunk = self._parse_method(
@@ -130,11 +160,14 @@ class JavaParser:
 
         # 也为整个类生成一个 overview chunk
         class_chunk = CodeChunk(
-            chunk_id=self._make_id(file_path, f"class:{class_name}"),
+            chunk_id=self._make_id(
+                file_path,
+                f"{type_name}:{class_name}:{class_node.start_point[0] + 1}",
+            ),
             file_path=str(file_path),
             file_type="java",
             language="java",
-            chunk_type="class",
+            chunk_type=type_name,
             name=class_name,
             qualified_name=self._get_qualified_name(class_node, class_name),
             line_start=class_node.start_point[0] + 1,
@@ -174,7 +207,10 @@ class JavaParser:
         called_methods = self._extract_method_calls(method_node, content)
 
         chunk = CodeChunk(
-            chunk_id=self._make_id(file_path, f"method:{class_name}.{method_name}"),
+            chunk_id=self._make_id(
+                file_path,
+                f"method:{class_name}.{method_name}:{method_node.start_byte}",
+            ),
             file_path=str(file_path),
             file_type="java",
             language="java",
@@ -229,22 +265,70 @@ class JavaParser:
         return m.group(1) if m else None
 
     def _extract_method_calls(self, method_node, content: str) -> List[str]:
-        """提取方法体内的方法调用"""
-        calls = []
+        """
+        提取方法体内的方法调用。
+
+        返回格式统一为 "receiver.method" 或 "method" (无接收者时)。
+        带上接收者是为跨文件调用图消歧服务的:
+          agentConfService.updateStatusByAgentId()  ->  "agentConfService.updateStatusByAgentId"
+          updateStatusByAgentId()                   ->  "updateStatusByAgentId"
+
+        只保留裸方法名会导致全库同名方法无法消歧(实测 list/save/update
+        重复率极高), 缝合时会大量连错。
+        """
+        calls: List[str] = []
         self._walk_calls(method_node, calls, content)
-        return list(set(calls))[:50]  # 去重, 限制 50 个
+        # 去重保序
+        seen = set()
+        out: List[str] = []
+        for c in calls:
+            if c not in seen:
+                seen.add(c)
+                out.append(c)
+        return out[:80]  # 上限 80, 避免超大方法把索引撑爆
 
     def _walk_calls(self, node, calls: List[str], content: str):
-        """递归遍历找 method_invocation"""
+        """
+        递归遍历找 method_invocation, 同时提取调用接收者。
+
+        tree-sitter-java 里 method_invocation 的孩子顺序:
+            [接收者...]  "."  方法名  实参
+        例如 agentConfMapper.updateStatusByAgentId(a, b):
+            identifier(agentConfMapper) | "." | identifier(updateStatusByAgentId) | argument_list
+        """
         if node.type == "method_invocation":
-            # 提取 调用名
-            for child in node.children:
-                if child.type == "identifier":
-                    txt = self._get_text(child, content)
-                    if txt:
-                        calls.append(txt)
+            kids = list(node.children)
+            dot_idx = -1
+            for i, child in enumerate(kids):
+                if child.type == ".":
+                    dot_idx = i
                     break
-        if hasattr(node, 'children'):
+
+            if dot_idx > 0:
+                # "." 之前是接收者, "." 之后第一个 identifier 是方法名
+                method_node = None
+                for child in kids[dot_idx + 1:]:
+                    if child.type in ("identifier", "field_access"):
+                        method_node = child
+                        break
+                if method_node is not None:
+                    method_name = self._get_text(method_node, content)
+                    receiver = self._get_text(kids[0], content)
+                    if receiver.startswith("this"):
+                        receiver = ""  # this.xxx() 不带消歧信息
+                    if method_name:
+                        calls.append(
+                            f"{receiver}.{method_name}" if receiver else method_name
+                        )
+            else:
+                # 无 ".": 可能是 field_access(this.a.b()) 或纯调用
+                for child in kids:
+                    if child.type == "identifier":
+                        calls.append(self._get_text(child, content))
+                        break
+            return  # 已处理本节点, 不再下钻避免重复统计
+
+        if hasattr(node, "children"):
             for child in node.children:
                 self._walk_calls(child, calls, content)
 
@@ -252,15 +336,41 @@ class JavaParser:
         if not content:
             return ""
         try:
-            return content[node.start_byte:node.end_byte]
+            # BUG fix: tree-sitter 的 start_byte/end_byte 是**字节**偏移,
+            # 而 content 是 Python str (字符语义). 源文件含中文/emoji 等
+            # 多字节字符时, 二者错位 -> 切出"从中间截断的代码片段".
+            #
+            # 实测症状 (customer-service 1152 条符号):
+            #   name = 'aService {\n\n  '          <- 应为 'CaptchaService'
+            #   qname= 'tchaService implement.{\n'  <- 应为 'GraphicCaptchaService'
+            # 表现为符号名里含 '{' '}' ';' 和换行, 严重污染检索结果.
+            #
+            # 修法: 用原始 bytes 按字节切片再解码, 保证偏移语义一致.
+            raw = content.encode("utf-8")
+            return raw[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
         except Exception:
             return ""
 
     def _make_id(self, file_path: Path, suffix: str) -> str:
         # 用文件路径 hash + suffix
+        # BUG-14 fix: suffix 里可能含 \n/* 等特殊字符 (Java 方法体解析)
+        # 这些会破坏 link_id (URL 路径参数). 改 sanitize: 去所有换行 + URL 特殊字符 + 截断
         import hashlib
+        import re
         path_hash = hashlib.md5(str(file_path).encode()).hexdigest()[:8]
-        return f"{path_hash}-{suffix}"
+        suffix_hash = hashlib.md5(suffix.encode()).hexdigest()[:8]
+        # 1) 替换所有换行/制表为单空格
+        clean = " ".join(suffix.split())
+        # 2) 去掉 URL 路径不允许的字符 (* ? \ " < > | 等)
+        clean = re.sub(r'[\\/*?"<>|]', '', clean)
+        # 3) 多个连续空格压成单空格
+        clean = re.sub(r' +', ' ', clean)
+        # 4) 截断到 60 字符
+        if len(clean) > 60:
+            clean = clean[:60]
+        # 5) 去尾部非 word 字符
+        clean = clean.rstrip("/\\:*?\"<>| \t\n")
+        return f"{path_hash}-{clean}-{suffix_hash}"
 
 
 # ============================================================
@@ -276,12 +386,16 @@ class VueParser:
         self.parser = Parser(JS_LANGUAGE)
 
     def parse_file(self, file_path: Path) -> List[CodeChunk]:
-        """解析 .vue 文件"""
+        """解析 Vue SFC 或独立 JS/TS 文件。"""
         try:
             content = file_path.read_text(encoding="utf-8", errors="replace")
         except Exception as e:
             logger.warning(f"读取文件失败 {file_path}: {e}")
             return []
+
+        is_vue = file_path.suffix.lower() == ".vue"
+        if not is_vue:
+            return self._parse_script(content, file_path, 0)
 
         # 提取 <script> 块
         import re
@@ -289,23 +403,40 @@ class VueParser:
             r'<script[^>]*>(.*?)</script>', content, re.DOTALL
         )
         if not script_match:
-            return []
+            return [CodeChunk(
+                chunk_id=self._make_id(file_path, "vue:template"),
+                file_path=str(file_path),
+                file_type="vue",
+                language="vue",
+                chunk_type="vue_template",
+                name=file_path.stem,
+                line_start=1,
+                line_end=content.count("\n") + 1,
+                code_content=content,
+            )]
 
         script_content = script_match.group(1)
         line_offset = content[:script_match.start(1)].count('\n')
 
+        return self._parse_script(script_content, file_path, line_offset)
+
+    def _parse_script(
+        self, script_content: str, file_path: Path, line_offset: int
+    ) -> List[CodeChunk]:
         tree = self.parser.parse(bytes(script_content, "utf-8"))
 
         # 找 export default { ... }
         chunks = []
-        for node in tree.root_node.children:
+        for export_index, node in enumerate(tree.root_node.children):
             if node.type == "export_statement":
                 chunks.append(CodeChunk(
-                    chunk_id=self._make_id(file_path, "vue:default"),
+                    chunk_id=self._make_id(
+                        file_path, f"javascript:export:{export_index}:{node.start_byte}"
+                    ),
                     file_path=str(file_path),
-                    file_type="vue",
-                    language="vue",
-                    chunk_type="vue_component",
+                    file_type=file_path.suffix.lower().lstrip("."),
+                    language="vue" if file_path.suffix.lower() == ".vue" else "javascript",
+                    chunk_type="vue_component" if file_path.suffix.lower() == ".vue" else "javascript_module",
                     name=file_path.stem,
                     line_start=line_offset + node.start_point[0] + 1,
                     line_end=line_offset + node.end_point[0] + 1,
@@ -317,9 +448,9 @@ class VueParser:
             chunks.append(CodeChunk(
                 chunk_id=self._make_id(file_path, "vue:script"),
                 file_path=str(file_path),
-                file_type="vue",
-                language="vue",
-                chunk_type="vue_script",
+                file_type=file_path.suffix.lower().lstrip("."),
+                language="vue" if file_path.suffix.lower() == ".vue" else "javascript",
+                chunk_type="vue_script" if file_path.suffix.lower() == ".vue" else "javascript_module",
                 name=file_path.stem,
                 line_start=1,
                 line_end=script_content.count('\n') + 1,
@@ -329,15 +460,27 @@ class VueParser:
         return chunks
 
     def _get_text(self, node, content: str) -> str:
+        # BUG fix: 同Java 版 _get_text, 按字节偏移切片后再解码.
+        # 中文源码下用字符偏移直切会得到截断的代码片段.
         try:
-            return content[node.start_byte:node.end_byte]
+            raw = content.encode("utf-8")
+            return raw[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
         except Exception:
             return ""
 
     def _make_id(self, file_path: Path, suffix: str) -> str:
+        # BUG-14 fix: 同 JavaParser._make_id, 用正则去所有 URL 特殊字符
         import hashlib
+        import re
         path_hash = hashlib.md5(str(file_path).encode()).hexdigest()[:8]
-        return f"{path_hash}-{suffix}"
+        suffix_hash = hashlib.md5(suffix.encode()).hexdigest()[:8]
+        clean = " ".join(suffix.split())
+        clean = re.sub(r'[\\/*?"<>|]', '', clean)
+        clean = re.sub(r' +', ' ', clean)
+        if len(clean) > 60:
+            clean = clean[:60]
+        clean = clean.rstrip("/\\:*?\"<>| \t\n")
+        return f"{path_hash}-{clean}-{suffix_hash}"
 
 
 # ============================================================
@@ -361,9 +504,34 @@ class CodeParser:
             return self.vue.parse_file(file_path)
         elif suffix in (".js", ".ts") and self.vue:
             return self.vue.parse_file(file_path)
+        elif suffix in (".xml", ".yml", ".yaml", ".properties"):
+            return self._parse_config(file_path)
         else:
-            # 不支持的文件类型, 返回空
             return []
+
+    @staticmethod
+    def _parse_config(file_path: Path) -> List[CodeChunk]:
+        """将 XML/YAML/Properties 作为完整文件 chunk 保留，避免配置丢失。"""
+        import hashlib
+
+        try:
+            content = file_path.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            logger.warning(f"读取配置文件失败 {file_path}: {e}")
+            return []
+        suffix = file_path.suffix.lower().lstrip(".") or "config"
+        digest = hashlib.md5(str(file_path).encode()).hexdigest()[:8]
+        return [CodeChunk(
+            chunk_id=f"{digest}-config:{file_path.stem}",
+            file_path=str(file_path),
+            file_type=suffix,
+            language=suffix,
+            chunk_type="config",
+            name=file_path.name,
+            line_start=1,
+            line_end=content.count("\n") + 1,
+            code_content=content,
+        )]
 
 
 if __name__ == "__main__":

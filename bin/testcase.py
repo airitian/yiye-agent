@@ -31,6 +31,11 @@ logger = get_logger(__name__)
 # 让 init / 全局检查能读到 .env 里的 key (override=False: 系统 env 优先)
 load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=False)
 
+# P0-5 fix: 启动时收紧 .env 权限 (默认 644 改 600).
+# 跨平台: POSIX 真实生效, Windows 走 NTFS ACL (Python 工具无能为力, 显式跳过).
+from src.path_utils import secure_file  # noqa: E402
+secure_file(PROJECT_ROOT / ".env", 0o600)
+
 
 # v0.5.9: 把常见 ASCII 兼容 emoji 映射到 [TAG] 形式, 防止 Windows GBK
 # stdout 在打印含 emoji 时抛 UnicodeEncodeError. 表中未覆盖的新 emoji
@@ -202,14 +207,14 @@ def init():
     click.echo()
     click.echo("API Key 检查:")
     import os
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    api_key = os.environ.get("RIGHTAPI_API_KEY")
     if api_key:
-        click.echo(f"   ✅ ANTHROPIC_API_KEY ({len(api_key)} 字符)")
+        click.echo(f"   ✅ RIGHTAPI_API_KEY ({len(api_key)} 字符)")
     else:
-        click.echo(f"   ❌ ANTHROPIC_API_KEY 未设置")
+        click.echo(f"   ❌ RIGHTAPI_API_KEY 未设置")
         click.echo(f"      两种设置方式:")
-        click.echo(f"      1. 在项目根 .env 文件加: ANTHROPIC_API_KEY=你的key")
-        click.echo(f"      2. 或设置系统环境变量: set ANTHROPIC_API_KEY=你的key")
+        click.echo(f"      1. 在项目根 .env 文件加: RIGHTAPI_API_KEY=你的key")
+        click.echo(f"      2. 或设置系统环境变量: set RIGHTAPI_API_KEY=你的key")
 
     # 5. 检查数据目录
     click.echo()
@@ -260,19 +265,87 @@ def kb_stats(domain):
 
 @kb.command(name='build')
 @click.argument('domain', required=False)
-def kb_build(domain):
-    """构建知识库索引 (不传 domain 跑全部)"""
+@click.option('--facts/--no-facts', default=True,
+              help='是否抽取业务事实并生成用例(需要 requirements/ 下的需求文档)')
+@click.option('--llm/--no-llm', default=True,
+              help='是否用 LLM 给 chunk 打业务标签/摘要。'
+                   '全量 8 域上万个 chunk 时建议 --no-llm: '
+                   '实测 payment 域 266 chunks 就花了 90s, 全量会跑数小时')
+def kb_build(domain, facts, llm):
+    """
+    构建知识库索引 (不传 domain 跑全部)
+
+    同一份需求会对每个域各跑一遍 Fact 抽取 —— 这是有意为之:
+    需求说「客服异常自动下线」, 实现可能在 customer-service 也可能在 cross,
+    哪个域能凑够 2 组证据, 门禁就自动把这条事实收进哪个域。
+    """
     from src.kb_build import build_all_domains
+    req_dir = PROJECT_ROOT / "requirements"
+    if facts and not req_dir.exists():
+        click.echo(f"⚠️  {req_dir} 不存在, 本次只建符号索引, 不抽 Fact")
+        facts = False
+    if not llm:
+        click.echo("ℹ️  已关闭 LLM 增强(chunk 业务标签/摘要将为空, "
+                   "但不影响符号/调用图/Fact 抽取)")
+
     results = build_all_domains(
         project_root=PROJECT_ROOT,
         kb_root=PROJECT_ROOT,
         only_domain=domain,
+        requirements_dir=req_dir if facts else None,
+        enrich_with_llm=llm,
     )
     click.echo()
     click.echo("=" * 60)
     click.echo("✅ 构建完成")
-    for d, stats in results.items():
-        click.echo(f"   {d}: {stats.get('chunks', 0)} chunks, {stats.get('files', 0)} 文件")
+    # build_all_domains 返回 list[dict] (失败项也带 error 字段),
+    # 这里按列表遍历 —— 原代码按 dict.items() 迭代, 跑完 1 小时才在
+    # 打印阶段崩掉, 索引其实早就建好了, 报错极具误导性。
+    for st in results:
+        name = st.get("domain", "?")
+        if st.get("error"):
+            click.echo(f"   {name}: ❌ {st['error']}")
+            continue
+        bits = [f"{st.get('chunks_created', 0)} chunks",
+                f"{st.get('files_scanned', 0)} 文件"]
+        for key, label in (("sql_statements", "SQL"),
+                           ("data_links", "链路")):
+            v = st.get(key)
+            if isinstance(v, dict):
+                bits.append(f"{label}={v.get('accepted', len(v))}")
+            elif v:
+                bits.append(f"{label}={v}")
+        f = st.get("facts")
+        if isinstance(f, dict):
+            # 事实层要显式打印三个数: 入库数 / 证据不足数 / 规则覆盖率。
+            # 只打印"事实=13"看不出 13 条里有没有覆盖, 也看不出拒收了多少 ——
+            # 而拒收的那些恰恰是要去补需求/补代码的清单。
+            bits.append(f"事实={f.get('accepted', 0)}")
+            rej = len(f.get("rejected_detail") or [])
+            if rej:
+                bits.append(f"证据不足={rej}")
+            cc = f.get("case_coverage") or {}
+            if cc:
+                bits.append(f"用例={cc.get('case_total', 0)}")
+                bits.append(f"规则覆盖={cc.get('fact_covered', 0)}/"
+                            f"{cc.get('fact_total', 0)}")
+        click.echo(f"   {name}: " + ", ".join(bits))
+
+
+@kb.command(name='build-requirements')
+def kb_build_requirements():
+    """构建需求文档知识库 (JSON 分块 + SQLite FTS5)"""
+    from src.requirement_index import build_requirement_index
+
+    stats = build_requirement_index(
+        PROJECT_ROOT / "requirements",
+        PROJECT_ROOT / "domains" / "requirements" / "_index.db",
+    )
+    click.echo(
+        f"✅ 需求知识库完成: {stats['files_scanned']} 文件 / "
+        f"{stats['chunks_created']} chunks / "
+        f"{stats['parse_errors']} 解析错误"
+    )
 
 
 @kb.command(name='search')
@@ -280,7 +353,7 @@ def kb_build(domain):
 @click.option('--domain', '-d', required=True, help='业务域')
 @click.option('--limit', '-l', default=10, help='返回数量')
 def kb_search(query, domain, limit):
-    """代码检索 (BM25)"""
+    """代码检索 (符号 + 全文 + 标签 三路合并)"""
     from src.index_builder import IndexSearcher
 
     db_path = PROJECT_ROOT / "domains" / domain / "_index.db"
@@ -288,8 +361,10 @@ def kb_search(query, domain, limit):
         click.echo(f"❌ 域 [{domain}] 索引不存在. 先跑 testcase kb build {domain}", err=True)
         sys.exit(1)
 
-    searcher = IndexSearcher(str(db_path))
-    results = searcher.search(query, limit=limit)
+    # 必须用 with: IndexSearcher 的连接是在 __enter__ 里建的,
+    # 直接构造后调search() 会因 self._conn 为 None 抛 AttributeError
+    with IndexSearcher(db_path, domain) as searcher:
+        results = searcher.search(query, limit=limit)
 
     if not results:
         click.echo(f"未找到匹配 [{query}]", err=True)
@@ -550,9 +625,10 @@ def ui(host, port, reload):
     click.echo("=" * 60)
     click.echo(f"🌐 启动 Web UI: http://{host}:{port}")
     click.echo("=" * 60)
-    click.echo("   📋 /tasks - 任务列表")
-    click.echo("   📊 /flows/<task_id> - 任务流程")
-    click.echo("   🛑 /review/<task_id> - 案例审核")
+    click.echo(f"   🏠 http://{host}:{port}/ - 任务列表 (唯一列表页)")
+    click.echo(f"   📊 /flows/<task_id> - 任务流程")
+    click.echo(f"   🛑 /review/<task_id> - 用例审核")
+    click.echo(f"   📝 /requirement - 新建需求")
 
     uvicorn.run(
         app,

@@ -38,8 +38,11 @@ def _make_chunk_id(file_path: Path, suffix: str) -> str:
 
 
 def _safe_text(node, content: str) -> str:
+    # BUG fix: tree-sitter 偏移是字节语义, 需按字节切片再解码,
+    # 否则中文源码会切出截断片段 (同 code_parser._get_text)
     try:
-        return content[node.start_byte:node.end_byte]
+        raw = content.encode("utf-8")
+        return raw[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
     except Exception:
         return ""
 
@@ -502,54 +505,54 @@ def update_db_with_chunks(domain_db_path: Path, domain: str, file_path: str, chu
             pass
 
     from datetime import datetime
-    conn = sqlite3.connect(str(domain_db_path))
-    cur = conn.cursor()
-    now = datetime.now().isoformat()
-    for ch in chunks:
-        cur.execute(
-            """INSERT OR REPLACE INTO symbols
-               (chunk_id, domain, file_path, file_type, language, chunk_type,
-                name, qualified_name, line_start, line_end, http_route,
-                business_tags, summary, created_at, updated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                ch["chunk_id"], domain, file_path,
-                "java" if file_path.endswith(".java") else "vue",
-                "java" if file_path.endswith(".java") else "vue",
-                ch.get("chunk_type", "unknown"),
-                ch.get("name", ""), ch.get("qualified_name", ""),
-                ch.get("line_start", 0), ch.get("line_end", 0),
-                ch.get("http_route"),
-                ch.get("business_tags", "[]"),
-                ch.get("summary", ""),
-                now, now,
-            ),
-        )
-        cur.execute("DELETE FROM code_fts WHERE chunk_id=?", (ch["chunk_id"],))
-        cur.execute(
-            """INSERT INTO code_fts
-               (chunk_id, domain, file_path, name, qualified_name,
-                code_content, summary)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (
-                ch["chunk_id"], domain, file_path,
-                ch.get("name", ""), ch.get("qualified_name", ""),
-                ch.get("code_preview", ""),
-                ch.get("summary", ""),
-            ),
-        )
-        cur.execute("DELETE FROM chunks WHERE chunk_id=?", (ch["chunk_id"],))
-        cur.execute(
-            """INSERT INTO chunks
-               (chunk_id, domain, file_path, chunk_data, indexed_at)
-               VALUES (?, ?, ?, ?, ?)""",
-            (
-                ch["chunk_id"], domain, file_path,
-                json.dumps(ch, ensure_ascii=False), now,
-            ),
-        )
-    conn.commit()
-    conn.close()
+    # P0-1 fix: 用 with 块保证 commit + close, 中途异常不会泄漏连接 / 撕裂事务
+    with sqlite3.connect(str(domain_db_path)) as conn:
+        cur = conn.cursor()
+        now = datetime.now().isoformat()
+        for ch in chunks:
+            cur.execute(
+                """INSERT OR REPLACE INTO symbols
+                   (chunk_id, domain, file_path, file_type, language, chunk_type,
+                    name, qualified_name, line_start, line_end, http_route,
+                    business_tags, summary, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    ch["chunk_id"], domain, file_path,
+                    "java" if file_path.endswith(".java") else "vue",
+                    "java" if file_path.endswith(".java") else "vue",
+                    ch.get("chunk_type", "unknown"),
+                    ch.get("name", ""), ch.get("qualified_name", ""),
+                    ch.get("line_start", 0), ch.get("line_end", 0),
+                    ch.get("http_route"),
+                    ch.get("business_tags", "[]"),
+                    ch.get("summary", ""),
+                    now, now,
+                ),
+            )
+            cur.execute("DELETE FROM code_fts WHERE chunk_id=?", (ch["chunk_id"],))
+            cur.execute(
+                """INSERT INTO code_fts
+                   (chunk_id, domain, file_path, name, qualified_name,
+                    code_content, summary)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    ch["chunk_id"], domain, file_path,
+                    ch.get("name", ""), ch.get("qualified_name", ""),
+                    ch.get("code_preview", ""),
+                    ch.get("summary", ""),
+                ),
+            )
+            cur.execute("DELETE FROM chunks WHERE chunk_id=?", (ch["chunk_id"],))
+            cur.execute(
+                """INSERT INTO chunks
+                   (chunk_id, domain, file_path, chunk_data, indexed_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    ch["chunk_id"], domain, file_path,
+                    json.dumps(ch, ensure_ascii=False), now,
+                ),
+            )
+        conn.commit()
 
 
 def run_domain_audit(

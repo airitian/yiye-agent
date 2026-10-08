@@ -7,7 +7,7 @@
 # ============================================================
 
 # --- LLM 调用 ---
-anthropic>=0.40.0          # MiniMax 通过 Anthropic 协议调用
+requests>=2.31.0           # rightapi Responses API HTTP 客户端
 python-dotenv>=1.0.0       # 从 .env 文件读 API key (替代环境变量)
 
 # --- CLI ---

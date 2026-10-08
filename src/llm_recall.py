@@ -296,19 +296,18 @@ def parse_recall_response(response: str) -> Optional[List[Dict[str, Any]]]:
     if fence:
         text = fence.group(1).strip()
 
-    # 找 JSON 数组
-    arr_match = re.search(r'\[.*\]', text, re.DOTALL)
-    if not arr_match:
-        logger.warning("LLM 召回响应里找不到 JSON 数组")
+    # P0-3 fix: 用 raw_decode 替代贪婪 re.search 找 JSON 数组
+    from src.json_utils import extract_json
+    parsed = extract_json(text)
+    if parsed is None:
+        logger.warning("LLM 召回响应里找不到 JSON")
         return None
 
-    try:
-        parsed = json.loads(arr_match.group(0))
-    except json.JSONDecodeError as e:
-        logger.warning(f"LLM 召回响应 JSON 解析失败: {e}")
-        return None
-
+    # 容错: LLM 偶尔漏 [], 拿到 dict 时包成 list
+    if isinstance(parsed, dict):
+        parsed = [parsed]
     if not isinstance(parsed, list):
+        logger.warning(f"LLM 召回响应不是 list, 实际类型: {type(parsed).__name__}")
         return None
 
     # 校验每项是 dict 且有 chunk_id

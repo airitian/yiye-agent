@@ -4,7 +4,7 @@
 > **任何修改必须在 commit 前先更新本文件**
 > **遵循 [Keep a Changelog](https://keepachangelog.com/) 规范**
 
-最后更新: 2026-06-27
+最后更新: 2026-10-09
 
 ---
 
@@ -31,9 +31,208 @@
 
 ## [Unreleased]
 
-### 进行中
+### [2026-10-09] 需求内容哈希去重
 
-暂无.
+**类型**: Added
+**文件**: `src/req_dedup.py` (新), `src/kb_build.py`, `tests/test_req_dedup.py`
+**ADR 引用**: ADR-017
+**原因**: `requirements/` 下 46 个 json 实测按内容分组只有 **8 组**,
+其中一组 26 个文件(`1.json`/`ce001.json`/`test002.json`/`测试这个.json` ...)
+承载同一份「客服获客助手异常自动下线」需求, 差别只在 `req_id` 与 `title`。
+不去重则同一批规则被抽 26 遍, 覆盖报告分母被灌水。
+**影响**:
+- 新增 `src/req_dedup.py`: 规范化(排身份字段 + 循环还原多层转义 + 剥空白) → SHA-256 分组
+- 组内代表取**原始文本最短**者(= 转义层数最少, 最干净)
+- `_req_files` 改为调用新模块, 36 份 → 8 份
+
+**回归检查**:
+- [x] 新增 20 条测试 (含"组内选代表不能退化成按文件名取第一个"的判别性断言)
+- [x] 没改变已记录的 ADR
+- [x] Token 安全检查通过 (未涉及)
+- [x] 不破坏现有功能 (224 → 264 passed)
+
+**踩坑**: 最初用"payload 最大者"做代表选取, 但该指标衡量的是**规范化后**的长度,
+而组内哈希相同就意味着规范化结果逐字节相同 —— 该值在组内**恒等**, 完全没有区分力。
+测试直接把这个事实钉死(`test_payload_size_is_constant_within_group`)。
+
+---
+
+### [2026-10-09] 新增 cases 表, 用例正文落库
+
+**类型**: Added
+**文件**: `src/index_builder.py`, `src/fact_case_generator.py`, `src/business_qa.py`, `tests/test_cases_store.py`
+**ADR 引用**: ADR-014
+**原因**: `case_fact_map` 只存 case_id → fact_id 映射, 用例正文在内存里生成完就丢。
+后果: 业务问答里「这条规则有没有测过」「具体怎么测的」两问只能给一个计数,
+给不出用例标题与预期结果 —— 而业务方要的就是后者。
+**影响**:
+- `FACT_SCHEMA_SQL` 新增 `cases` 表 (标题/维度/前置/步骤/预期/断言/表引用/可判定性)
+- `IndexBuilder` 新增 `add_cases()` / `get_cases()` / `search_cases()`
+- `add_cases()` **自动回填** `case_fact_map` —— 只写正文不写映射会让覆盖报告全线报未覆盖且不报错
+- `FactCaseGenerator.generate()` 改为按 `fact_id` 取 refs, 并支持从 Fact 证据自动推导
+- `_build_facts()` 接入用例生成, 构建结束即产出用例与覆盖率
+- `BusinessQA` 覆盖度路直接输出用例标题/维度/预期/涉及表, 不再只给计数
+
+**回归检查**:
+- [x] 新增 20 条测试
+- [x] 没改变已记录的 ADR
+- [x] Token 安全检查通过 (未涉及)
+- [x] 不破坏现有功能
+
+**顺带修掉的隐患**: `GeneratedCase.to_dict()` 里 `generated_by` 是硬编码字面量,
+而 `add_cases` 走 `getattr` 取属性 —— 序列化与入库两个来源不一致。
+已提升为正式字段, 单一真源。
+
+---
+
+### [2026-10-09] Fact 层回填工具 + 陈旧索引检测
+
+**类型**: Added
+**文件**: `tools/backfill_facts.py` (新), `tests/test_backfill_facts.py`, `bin/testcase.py`
+**ADR 引用**: ADR-014
+**原因**: 符号索引(解析 9000+ 文件)一次要几十分钟, 但改了 Fact 抽取逻辑后
+想验证效果**不需要重建符号索引** —— chunks 与 links 都能从已有索引库复原。
+另外 CLI 的 `kb build` 压根没传 `requirements_dir`, Fact 层从未被触发。
+**影响**:
+- `tools/backfill_facts.py`: 从 `chunks.chunk_data` 复原 CodeChunk,
+  从 `sql_index` 复原 SqlStatement, 重缝数据链路后重跑 Fact + 用例, 几十秒完成
+- **陈旧索引检测**: 索引里的 `called_methods` 全是裸方法名(不含接收者)时判定为陈旧并拒绝回填
+- CLI `kb build` 接入 `requirements_dir`, 新增 `--facts/--no-facts` 与 `--llm/--no-llm`
+- CLI 输出补上 `事实/证据不足/用例/规则覆盖` 四个数字
+
+**回归检查**:
+- [x] 新增 9 条测试
+- [x] 没改变已记录的 ADR
+- [x] Token 安全检查通过 (未涉及)
+- [x] 不破坏现有功能
+
+**实测发现**: 8 个域的索引**全部陈旧** —— `called_methods` 1249 条全是裸方法名
+(`updateComboCount`), 而当前解析器产出的是 `baseMapper.updateComboCount`。
+库是 `_walk_calls` 修好之前建的。接收者缺失会让 DataLink 的 exact 分支
+(唯一可信的那条)永远走不到, 全域降级为 guess, 而**不报任何错**。
+已加显式告警 + 陈旧检测拦停。
+
+---
+
+### [2026-10-09] 修 clear_domain 漏清 Fact 层导致一条用例挂两个 fact_id
+
+**类型**: Fixed
+**文件**: `src/index_builder.py`, `tools/backfill_facts.py`, `tests/test_cases_store.py`
+**ADR 引用**: ADR-014
+**原因**: `case_id` 是 `FACT-0001` 这种序号, 每轮重新生成都会复用同一批编号;
+而 `fact_id` 是内容哈希, 需求文件一变就变。`case_fact_map` 主键是
+`(case_id, fact_id)`, `INSERT OR REPLACE` **覆盖不掉另一条**。
+`clear_domain` 只清符号索引, 不清 facts/cases/case_fact_map。
+**影响**:
+- 实测 customer-service 重跑后 138 条用例里 **98 条挂着 2 个 fact_id**,
+  覆盖报告把一条用例算到两个业务规则头上。**症状只是数字虚高, 全程不报错。**
+- 新增 `clear_fact_layer()` 作为单一清理入口; `clear_domain()` 调用它
+- `backfill_facts.py` 里内联复制的清库逻辑改为调用同一入口(之前两处各清一半)
+- `add_cases()` 写入前先删该 case_id 的旧映射(第二道防线)
+
+**回归检查**:
+- [x] 新增 4 条测试, 含全库校验"不存在一条用例挂多个 fact_id"
+- [x] 没改变已记录的 ADR
+- [x] Token 安全检查通过 (未涉及)
+- [x] 不破坏现有功能
+
+**教训**: 同一份清理逻辑写在两处时, 一定会分叉。凡是"多处都要做同一件事",
+必须收敛到单一入口。
+
+---
+
+### [2026-10-09] 修 table_refs 装成了 Mapper 方法名而非表名
+
+**类型**: Fixed
+**文件**: `src/fact_case_generator.py`, `src/business_qa.py`, `tests/test_cases_store.py`
+**ADR 引用**: ADR-014
+**原因**: `EV_TABLE` 的 `ref_uri` 存的是 SQL id
+(`ai.yiye.dao.XxxMapper.getTotalReportByAgentId`, 为溯源),
+真实表名(CSV, 如 `agent_conf,boss_order`)在 `snippet` 里。
+`_table_refs_from_evidence()` 取了 `ref_uri`。
+**影响**:
+- `cases.table_refs` 装满 qualified_stmt, `data_consistency` 维度的"涉及表"
+  变成一串 Mapper 方法名, 表级断言立不住 —— 但看起来"有引用", 极易漏检
+- 8 个域回填后校验: 含 `Mapper` 的 table_refs 从 98 → **0**
+- 顺带补 `classify()` 的问句覆盖: 「手动上线怎么验证的」原本判为 UNKNOWN
+  (明明有 18 条用例却答不出来), 现已并入 COVERAGE 路
+
+**回归检查**:
+- [x] 新增 2 条测试, 含"table_refs 里混进 Mapper 名"的显式断言
+- [x] 没改变已记录的 ADR
+- [x] Token 安全检查通过 (未涉及)
+- [x] 不破坏现有功能
+
+---
+
+### [2026-10-09] 补齐 kb list / kb stats 两个从未实现的函数
+
+**类型**: Fixed
+**文件**: `src/kb_build.py`, `tests/test_cli_commands.py` (新)
+**原因**: `bin/testcase.py` 的 `kb list` 与 `kb stats` 引用
+`list_domains()` / `show_stats()`, 但这两个函数**在 src/kb_build.py 里从未存在** ——
+一敲就 `ImportError`。
+**影响**:
+- 实现 `list_domains()`: 从 kb-config.yaml 读, 返回配置里定义的域
+  (而非仅已建索引的域 —— 用户问的是"这项目该有哪些域")
+- 实现 `show_stats()`: **直接查库而非读 index_meta**。Fact 层可以在不重建
+  符号索引的情况下反复回填, meta 早已过期, 读它会让用户看到"事实=0"
+  而库里明明有 13 条
+- `show_stats` 输出的覆盖度行强制附带"只反映有无用例回填, 不代表断言正确"
+- 新增 `tests/test_cli_commands.py` 13 条测试
+
+**回归检查**:
+- [x] 新增 13 条测试
+- [x] 没改变已记录的 ADR
+- [x] Token 安全检查通过 (未涉及)
+- [x] 不破坏现有功能
+
+**教训(本项目已栽三次)**:
+同一类问题 —— 「有测试」≠「覆盖了用户会敲的命令」:
+1. `kb search` 调 `searcher.search()` —— 该方法不存在
+2. `build_all_domains` 返回 list, CLI 按 dict.items() 迭代
+3. `kb list` / `kb stats` 引用从未实现的函数
+
+三次都是用户实际会敲的命令, 而 293 条测试一条都没覆盖。
+补测试时要专门盯**命令入口**本身(注册了哪些子命令、参数是否齐全、
+被引用的符号是否存在), 而不只是核心算法。
+
+---
+
+### [2026-10-09] kb build 接入 Fact 层并新增 --no-llm
+
+**类型**: Changed
+**文件**: `bin/testcase.py`
+**原因**: `kb build` 从未传 `requirements_dir`, 所以 Fact 层**从未被 CLI 触发过** ——
+只有手工调 `build_all_domains` 才会跑。另一个问题: 默认 `enrich_with_llm=True`,
+全量 8 域上万个 chunk 会跑数万次 LLM 调用。
+**影响**:
+- `kb build` 默认接入 Fact 抽取与用例生成; `--no-facts` 可关闭
+- 新增 `--no-llm`: 实测 payment 域 266 chunks 从 **91.3s → 0.3s**(303 倍)
+- 构建结果输出补上 `事实/证据不足/用例/规则覆盖` 四个数字
+
+**回归检查**:
+- [x] 测试覆盖新参数已注册
+- [x] 没改变已记录的 ADR
+- [x] Token 安全检查通过 (未涉及)
+- [x] 不破坏现有功能
+
+**全量实测(8 域, 5059+2615+1192+468+380+230+91+52 = 10087 文件)**:
+
+| 域 | 文件 | 符号 | SQL | 数据链路 | 事实 | 用例 | 规则覆盖 |
+|---|---|---|---|---|---|---|---|
+| landing-page | 2615 | 8867 | 575 | 969 | 13 | 168 | 13/13 |
+| marketing | 1192 | 3799 | 432 | 534 | 13 | 156 | 13/13 |
+| cross | 5059 | 9977 | 205 | 298 | 13 | 123 | 13/13 |
+| customer-service | 468 | 1455 | 159 | 246 | 13 | 128 | 13/13 |
+| collect | 380 | 1241 | 80 | 102 | 13 | 142 | 13/13 |
+| message | 230 | 635 | 16 | 18 | 13 | 130 | 13/13 |
+| payment | 91 | 266 | 22 | 24 | 13 | 146 | 13/13 |
+| ucenter | 52 | 158 | 16 | 19 | 12 | 92 | 12/12 |
+
+合计: 26398 符号 / 1539 条 SQL / 103 条事实 / 2228 条证据 / 1073 条用例。
+**一致性校验全通过**: 多 fact_id 关联 0、孤儿映射 0、孤儿证据 0、
+用例数与映射数逐域相等。
 
 ---
 

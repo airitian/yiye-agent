@@ -75,6 +75,12 @@ class AuditLogger:
         self.audit_dir = Path(audit_dir)
         self.audit_dir.mkdir(parents=True, exist_ok=True)
         self.logger = logging.getLogger("audit")
+        # P0-5 fix: 收紧 audit_dir 目录权限, 并把历史 .jsonl 也收紧
+        # 审计数据含 actor / 业务 target / API 调用历史, 跟 .env 一样敏感
+        from src.path_utils import secure_file
+        secure_file(self.audit_dir, 0o700)
+        for old_log in self.audit_dir.glob("*.jsonl"):
+            secure_file(old_log, 0o600)
 
     def log(
         self,
@@ -98,6 +104,10 @@ class AuditLogger:
         log_file = self.audit_dir / f"{datetime.now().strftime('%Y-%m-%d')}.jsonl"
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        # P0-5 fix: 收紧新写入的审计文件权限 (默认 644 改为 600)
+        from src.path_utils import secure_file
+        secure_file(log_file, 0o600)
 
         # 同时打到主 logger (INFO 级别)
         level = logging.INFO if result == "success" else logging.ERROR
@@ -167,6 +177,11 @@ def setup_logging(
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(JSONFormatter())
         root.addHandler(fh)
+
+        # P0-5 fix: 收紧应用日志权限 (含 LLM prompt/response, 同样敏感)
+        from src.path_utils import secure_file
+        secure_file(log_path, 0o700)
+        secure_file(log_file, 0o600)
 
     # 降级第三方库的日志级别
     logging.getLogger("urllib3").setLevel(logging.WARNING)

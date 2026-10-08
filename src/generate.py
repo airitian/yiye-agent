@@ -23,6 +23,7 @@ from src.workspace import WorkspaceManager, TaskWorkspace
 from src.llm_client import get_default_client
 from src.prompt_loader import get_prompt_loader
 from src.index_builder import IndexSearcher
+from src.json_utils import extract_json
 
 logger = get_logger(__name__)
 
@@ -130,9 +131,10 @@ def stage1_extract_requirement(
             started, finished, error=str(e),
         )
         workspace.save_stage("stage1", "failed", started, finished, error=str(e))
-        # 失败时不阻塞, 返回空 dict 让 stage 2 走 fallback
-        logger.error(f"[stage1] 失败: {e}, 返回空 dict")
-        return {}
+        # BUG-1 fix: 之前静默 return {} 让下游不知道 stage1 失败
+        # task.db 里 stage1 状态会是 'failed', 上层 caller 能正确感知失败
+        logger.error(f"[stage1] 失败: {e}")
+        raise
 
 
 def stage2_extract_keywords(
@@ -175,11 +177,9 @@ def stage2_extract_keywords(
             temperature=0.3,
         )
 
-        # 解析 JSON
-        json_match = re.search(r'\{.*\}', response, re.DOTALL)
-        if json_match:
-            keywords = json.loads(json_match.group(0))
-        else:
+        # P0-3 fix: 用 raw_decode 替代贪婪 re.search, 避免多 JSON 块拼接
+        keywords = extract_json(response)
+        if keywords is None or not isinstance(keywords, dict):
             logger.warning(f"无法解析关键词响应: {response[:200]}")
             keywords = {"entities": [], "operations": [], "fields": [],
                         "business_concepts": [], "domain_hint": domain,
@@ -311,8 +311,12 @@ def stage3_link(
         except Exception as e:
             logger.warning(f"  LLM 召回入口异常, fallback: {e}")
 
-        # 如果 LLM 召回未成功, fallback 到 BM25 多路
-        if not llm_recall_success:
+        # BUG-2 fix: 之前 LLM 召回成功但 < 30 个时, 不补 BM25, stage 4 看到的代码少
+        # 改成: LLM 失败 OR 召回 < 30 个时, 跑 BM25 多路补足
+        if not llm_recall_success or len(candidates) < 30:
+            bm25_reason = "LLM召回失败, fallback BM25" if not llm_recall_success \
+                else f"LLM召回不足({len(candidates)}/30), BM25 补足"
+            logger.info(f"  BUG-2 fix: {bm25_reason}")
             with IndexSearcher(db_path, domain) as searcher:
                 # 路 1: 符号检索
                 for entity in keywords.get("entities", []):
@@ -328,30 +332,66 @@ def stage3_link(
                 for concept in keywords.get("business_concepts", []):
                     results = searcher.search_by_tag(concept, domain, limit=10)
                     candidates.extend(results)
+        # BUG-2: 如果 LLM 成功 + 候选足够, 跳过 BM25 (节省时间)
 
-        # 去重
-        seen = set()
-        unique = []
-        for c in candidates:
-            cid = c.get("chunk_id")
-            if cid and cid not in seen:
-                seen.add(cid)
-                unique.append(c)
-        candidates = unique
+                # 去重
+                seen = set()
+                unique = []
+                for c in candidates:
+                    cid = c.get("chunk_id")
+                    if cid and cid not in seen:
+                        seen.add(cid)
+                        unique.append(c)
+                candidates = unique
 
-        logger.info(f"  多路召回: {len(candidates)} 个候选 chunk (LLM={llm_recall_success})")
+                logger.info(f"  多路召回: {len(candidates)} 个候选 chunk (LLM={llm_recall_success})")
 
-        # v0.5.7+: 0 候选时也要写 links.json (空 list) + 标记 stage 失败,
-        #          不然 generate.gate.stage3 会误判成功, 让用户审核 0 召回 (无效)
-        if not candidates:
-            logger.warning("没有召回任何代码")
-            workspace.save_artifact("stage3", "links.json", [])
-            finished = datetime.now()
-            workspace.save_node("stage3.1_recall", "stage3", "success",
-                               started, finished, output_size=0)
-            workspace.save_stage("stage3", "failed", started, finished,
-                                 error="0 chunks 召回, 知识库无匹配")
-            return []
+                # BUG-8 fix: 4 级 fallback. 之前 0 candidates 立即 return, 浪费了
+                # 第 4 级 fallback: 直接用 keywords 的 raw 字段 + requirement 文本做 LIKE 模糊搜
+                if not candidates:
+                    logger.warning("BUG-8 fix: LLM+3 路 BM25 全失败, 尝试第 4 级 fallback (raw LIKE 模糊)")
+                    fallback_keywords = (
+                        keywords.get("entities", [])
+                        + keywords.get("search_queries", [])
+                        + keywords.get("business_concepts", [])
+                    )
+                    # 也加上 requirement 文本里的关键词
+                    req_text = json.dumps(requirement, ensure_ascii=False)[:500]
+                    # 简单分词: 提取中文字符 + 英文单词
+                    import re
+                    req_words = re.findall(r'[\u4e00-\u9fff]{2,}|[a-zA-Z_]{3,}', req_text)
+                    fallback_keywords.extend(req_words[:20])
+                    # 去空去重
+                    fallback_keywords = [k for k in dict.fromkeys(fallback_keywords) if k and len(k) >= 2]
+                    with IndexSearcher(db_path, domain) as searcher:
+                        for kw in fallback_keywords[:30]:
+                            try:
+                                results = searcher.search_fulltext(kw, domain, limit=5)
+                                candidates.extend(results)
+                            except Exception:
+                                pass
+                    # 再次去重
+                    seen = set()
+                    unique = []
+                    for c in candidates:
+                        cid = c.get("chunk_id")
+                        if cid and cid not in seen:
+                            seen.add(cid)
+                            unique.append(c)
+                    candidates = unique
+                    logger.info(f"  BUG-8 fix: 第 4 级 fallback 后 {len(candidates)} 个候选")
+
+                # v0.5.7+: 0 候选时也要写 links.json (空 list) + 标记 stage 失败,
+                #          不然 generate.gate.stage3 会误判成功, 让用户审核 0 召回 (无效)
+                if not candidates:
+                    logger.warning("4 级 fallback 全失败, 没有召回任何代码")
+                    workspace.save_artifact("stage3", "links.json", [])
+                    finished = datetime.now()
+                    workspace.save_node("stage3.1_recall", "stage3", "success",
+                                       started, finished, output_size=0)
+                    workspace.save_stage("stage3", "failed", started, finished,
+                                         error="0 chunks 召回, 4 级 fallback 全失败, 知识库无匹配")
+                    return []
 
         # 2. LLM 重排序
         finished_recall = datetime.now()
@@ -369,17 +409,22 @@ def stage3_link(
         client = get_default_client()
         loader = get_prompt_loader()
 
-        # 构造候选展示
-        cand_text = ""
-        for i, c in enumerate(candidates[:30], 1):
-            cand_text += f"\n[{i}] chunk_id={c['chunk_id']}\n"
-            cand_text += f"    类型: {c.get('chunk_type', '?')}\n"
-            cand_text += f"    名称: {c.get('qualified_name', c.get('name', '?'))}\n"
-            if c.get('http_route'):
-                cand_text += f"    HTTP: {c['http_route']}\n"
-            cand_text += f"    文件: {c.get('file_path', '?')}\n"
-            if c.get('summary'):
-                cand_text += f"    摘要: {c['summary']}\n"
+        # RAG fix (反幻觉 P0): 改用公共 build_chunks_text, 含 code_content
+        # 之前只展示 name/summary, LLM 看不到真实代码 → 评估 relevance 凭印象
+        from src.chunk_renderer import build_chunks_text
+        # stage3 candidates 是从 DB SELECT * 来的 dict 列表, 跟 links schema 不同
+        # build_chunks_text 期望 links schema (含 chunk_id), 构造最小适配
+        candidates_as_links = [
+            {"chunk_id": c.get("chunk_id", ""), "reason": c.get("reason", "")}
+            for c in candidates
+        ]
+        cand_text = build_chunks_text(
+            links=candidates_as_links,
+            db_path=db_path,
+            max_chunks=30,
+            code_per_chunk=300,
+            total_budget=8000,
+        )
 
         prompt = loader.render(
             "stage3_link",
@@ -394,41 +439,17 @@ def stage3_link(
             temperature=0.3,
         )
 
-        # 解析 - v0.2.2 容错: 剥 markdown 围栏 + 多 [{...},{...}] (贪婪匹配)
-        # 之前简单 re.search(r'\[.*\]', ...) 在 LLM 输出格式乱时 fail
-        text = response.strip()
-        # 剥 ```json ... ``` 围栏
-        fence = re.search(r'```(?:json)?\s*\n(.*?)\n```', text, re.DOTALL | re.IGNORECASE)
-        if fence:
-            text = fence.group(1).strip()
-            json_match = re.search(r'\[.*\]', text, re.DOTALL)
-        else:
-            json_match = re.search(r'\[.*\]', text, re.DOTALL)
-        # v0.2.2: 对前一个候选 (chunk_id 完整) 加 split by `}, {` 容错
-        if json_match:
-            raw = json_match.group(0)
-            try:
-                links = json.loads(raw)
-            except json.JSONDecodeError:
-                # 容错: 截断到最后一个完整对象 `}` 之前
-                last_brace = raw.rstrip().rfind('}')
-                if last_brace > 0:
-                    truncated = raw[:last_brace + 1]
-                    # 找到开头 `[`
-                    bracket_start = truncated.find('[')
-                    if bracket_start >= 0:
-                        truncated = truncated[bracket_start:]
-                        try:
-                            links = json.loads(truncated)
-                        except json.JSONDecodeError:
-                            logger.warning(f"stage3.2 rerank JSON parse 容错也失败, 返回空")
-                            links = []
-                    else:
-                        links = []
-                else:
-                    links = []
-        else:
-            links = []
+        # P0-3 fix: 改用 raw_decode, 不再用贪婪 re.search 拼多块
+        # 先剥 markdown 围栏 (LLM 偶尔包 ```json ... ```), 再 raw_decode
+        text = _strip_markdown_fence(response)
+        links = extract_json(text)
+        if not isinstance(links, list):
+            # 容错: 尝试 list 里包 dict 但 raw_decode 拿到 dict (LLM 漏 [])
+            if isinstance(links, dict):
+                links = [links]
+            else:
+                logger.warning(f"stage3.2 rerank JSON parse 失败, 返回空")
+                links = []
 
         # 保留高置信度 (>= 3)
         if links:
@@ -742,6 +763,7 @@ def stage4_scenarios(
     requirement: Dict[str, Any],
     links: List[Dict[str, Any]],
     domain: str,
+    project_root: Optional[Path] = None,
 ) -> List[Dict[str, Any]]:
     """推导业务场景"""
     started = datetime.now()
@@ -752,11 +774,22 @@ def stage4_scenarios(
         loader = _get_loader()
 
         # 构造输入
-        # v0.5.9: 截断 linked_text 防止 prompt 撑爆. 通常 6 个 chunk ×
-        # 100 字 = 600 字, 加上 requirement 2000 字, 总约 2600 字, 给
-        # LLM 充足 token budget 写场景内容.
+        # RAG fix (反幻觉 P0): 改用公共 build_chunks_text, 含 code_content
+        # 之前 json.dumps(links) 喂 LLM, links 本身不含 code_content → LLM 看不到代码
+        # P0-12 fix: project_root 参数化 (避免 NameError 回归)
+        if project_root is None:
+            project_root = Path(__file__).resolve().parent.parent
         req_text = json.dumps(requirement, ensure_ascii=False)[:2000]
-        linked_text = json.dumps(links[:10], ensure_ascii=False)[:4000]
+        from src.chunk_renderer import build_chunks_text
+        # stage4_db_path 跟 stage3 一致
+        stage4_db_path = project_root / "domains" / domain / "_index.db"
+        linked_text = build_chunks_text(
+            links=links,
+            db_path=stage4_db_path,
+            max_chunks=10,
+            code_per_chunk=400,
+            total_budget=4000,
+        )
 
         prompt = loader.render(
             "stage4_scenarios",
@@ -840,6 +873,22 @@ def stage5_generate_cases(
     # 不再依赖外部传参, 杜绝 dangling kwarg chain.
     if project_root is None:
         project_root = Path(__file__).resolve().parent.parent
+
+    # BUG-3 fix (P0-15): 过滤 stage 4 拒绝的 scenarios
+    # 之前 stage5 接收全部 scenarios (包括 human_approved=False 的), 用户拒绝按钮无效
+    # 默认 human_approved=True (向后兼容 - 没标字段 = 通过)
+    approved_scenarios = [s for s in scenarios if s.get("human_approved", True) is not False]
+    rejected_count = len(scenarios) - len(approved_scenarios)
+    if rejected_count > 0:
+        logger.info(
+            f"  BUG-3 fix: 过滤 {rejected_count} 个拒绝的 scenario, "
+            f"剩余 {len(approved_scenarios)} 个进 stage 5"
+        )
+    scenarios = approved_scenarios
+    if not scenarios:
+        logger.warning("  没有通过的 scenario, 跳过 stage 5")
+        return []
+
     # 批量阈值: 8 场景以上用批量 (更省 API 调用)
     BATCH_THRESHOLD = 8
     BATCH_SIZE = 3  # v0.3-D: 从 5 降到 3 (批更小, 单 prompt 字符数 -40%)
@@ -924,7 +973,17 @@ def stage5_generate_cases_batch(
             scenarios_text = "\n\n".join(scenarios_block)
 
             # 加载 stage5_case prompt 模板, 但把 scenarios 和 linked_chunks 都塞进去
-            linked_text = "\n".join([f"- {cid}" for cid in linked_chunks[:20]])
+            # RAG fix (反幻觉 P0): 改用公共 build_chunks_text, 含 code_content
+            # 之前只拼 "- chunk_id" 列表, 完全没有 code/name/summary
+            from src.chunk_renderer import build_chunks_text
+            batch_db_path = project_root / "domains" / domain / "_index.db"
+            linked_text = build_chunks_text(
+                links=[l for l in links if l.get("chunk_id")],
+                db_path=batch_db_path,
+                max_chunks=20,
+                code_per_chunk=300,
+                total_budget=4000,
+            )
             try:
                 base_template = loader.load("stage5_case")
                 prompt = (
@@ -1177,46 +1236,20 @@ def _generate_single_case(
 
     Note: 实际从 caller 处传 workspace.root, 不依赖 __file__.
     """
-    # 收集 chunk metadata: 根据 chunk_id 从 DB 查 (name, qualified_name, file_path, line, summary)
+    # RAG fix (反幻觉 P0): 改用公共 build_chunks_text
+    # 之前手写 24 行 SELECT/拼装, 不含 code_content → LLM 看不到 enum 值/method 签名
+    from src.chunk_renderer import build_chunks_text
+    # 兼容 caller 没传 project_root (向后兼容)
     if project_root is None:
-        # Fallback: caller 没传时用 cwd (向后兼容)
         project_root = Path.cwd()
     db_path = project_root / "domains" / domain / "_index.db"
-    chunks_lines = []  # noqa
-    for l in links[:10]:  # 最多 10 个 link
-        cid = l.get("chunk_id", "")
-        if not cid:
-            continue
-        # 从 DB 查 metadata
-        meta_name = "?"
-        meta_fpath = "?"
-        meta_line = "?"
-        meta_summary = ""
-        if db_path.exists():
-            try:
-                with sqlite3.connect(str(db_path)) as conn:
-                    conn.row_factory = sqlite3.Row
-                    row = conn.execute(
-                        "SELECT name, qualified_name, file_path, line_start, summary "
-                        "FROM symbols WHERE chunk_id = ?",
-                        (cid,),
-                    ).fetchone()
-                    if row:
-                        meta_name = (row["qualified_name"] or row["name"] or "?")[:50]
-                        meta_fpath = (row["file_path"] or "").split("/")[-1].split("\\")[-1]
-                        meta_line = row["line_start"] or "?"
-                        meta_summary = (row["summary"] or "")[:120]
-            except Exception:
-                pass
-        reason = l.get("reason", "")[:80]
-        chunks_lines.append(
-            f"- chunk_id: {cid}\n"
-            f"  name: {meta_name}\n"
-            f"  file: {meta_fpath}:{meta_line}\n"
-            f"  summary: {meta_summary}\n"
-            f"  link_reason: {reason}"
-        )
-    chunks_text = "\n".join(chunks_lines) if chunks_lines else "(无召回)"
+    chunks_text = build_chunks_text(
+        links=links,
+        db_path=db_path,
+        max_chunks=10,
+        code_per_chunk=400,
+        total_budget=4000,
+    )
 
     prompt = loader.render(
         "stage5_case",
@@ -1400,12 +1433,11 @@ def _parse_case_yaml(response: str, scenario: Dict, idx: int, domain: str):
     if isinstance(json_doc, list) and len(json_doc) == 1 and isinstance(json_doc[0], dict):
         candidates.append(json.dumps(json_doc[0], ensure_ascii=False))
     else:
-        try:
-            parsed_json = json.loads(text)
-            if isinstance(parsed_json, (dict, list)):
-                candidates.append(json.dumps(parsed_json, ensure_ascii=False))
-        except Exception:
-            pass
+        # P0-3 fix: 用 raw_decode 替代 json.loads(text) - LLM 输出含前言/后语时不爆
+        from src.json_utils import extract_json
+        parsed_json = extract_json(text)
+        if isinstance(parsed_json, (dict, list)):
+            candidates.append(json.dumps(parsed_json, ensure_ascii=False))
 
     parsed = None
     last_error = None
@@ -1529,12 +1561,14 @@ def _resolve_retry_context(
             "business_rules": [],
         }
 
-    # 决定 skip_stages (last_ok 之前全部跳过)
+    # 决定 skip_stages (包含 last_ok 本身)
+    # generate() 会从 artifact_source_task_id 复用 skip stage 的产物；
+    # 因此最后一个成功 stage 也必须跳过，否则 retry 会重新执行它并再次触发审核 gate。
     last_ok = old_ws.get_last_success_stage()
     if last_ok:
         order = ["stage1", "stage2", "stage3", "stage4", "stage5"]
         idx = order.index(last_ok)
-        skip_stages = order[: idx + 1]
+        skip_stages = order[:idx + 1]
     else:
         skip_stages = []
 
@@ -1831,7 +1865,7 @@ def generate(
         scenarios = _load_or_none("stage4", "scenarios.json")
         stage4_reused = scenarios is not None
         if scenarios is None:
-            scenarios = stage4_scenarios(workspace, requirement, links, domain)
+            scenarios = stage4_scenarios(workspace, requirement, links, domain, project_root)
         results["stages"]["stage4"] = scenarios
 
         # v0.5: 审核 gate (stage 4 完成后)

@@ -29,6 +29,32 @@ import sys
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# BUG-5 fix: 全局后台进程注册表 (避免 fire-and-forget 进程孤儿化)
+import atexit
+_BG_PROCESSES: Dict[int, Dict[str, Any]] = {}
+
+def _cleanup_bg_processes():
+    """atexit 钩子: uvicorn 关闭时清理所有后台子进程 + 关闭 log fd (BUG-10)"""
+    for pid, info in list(_BG_PROCESSES.items()):
+        try:
+            proc = info.get("_proc")
+            if proc and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except Exception:
+                    proc.kill()
+        except Exception:
+            pass
+        try:
+            log_h = info.get("_log_handle")
+            if log_h:
+                log_h.close()
+        except Exception:
+            pass
+    _BG_PROCESSES.clear()
+atexit.register(_cleanup_bg_processes)
+
 from src.logger import setup_logging
 from src.workspace import WorkspaceManager, STAGE_TO_REVIEW_STATUS
 
@@ -100,7 +126,61 @@ def get_task_detail(task_id: str) -> Optional[Dict[str, Any]]:
         detail["nodes"] = nodes_data
         detail["llm_calls"] = llm_data
         detail["task"] = dict(task_meta)  # 兼容旧调用方期待 detail.task
+        detail.update(_attach_continuation(detail))
         return detail
+
+
+def _attach_continuation(detail: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    给 partial 任务补上"续跑任务"线索.
+
+    背景: advance-stage 审核通过后, 会把旧任务状态写成 partial 并派生一个
+    新 task_id 承接后续 stage (见 api_advance_stage). 这是设计如此, 不是 bug.
+    但 API 只返回 partial, 外部编排者 (脚本/CI) 无从知道该跟哪个 task_id,
+    只能靠轮询猜 —— 实测会把"等待审核"误判成"卡死".
+
+    这里从 audit_log 里把最近一次 stage_advance 记录里的 new_task_id读出来,
+    以continuation_task_id / is_terminal 两个字段暴露给调用方.
+    """
+    out: Dict[str, Any] = {}
+    status = detail.get("status")
+    task_id = detail.get("task_id")
+
+    out["continuation_task_id"] = None
+    out["is_terminal"] = status in ("success", "failed")
+
+    if status != "partial" or not task_id:
+        return out
+
+    ws = detail.get("workspace")
+    if not ws:
+        return out
+
+    db_path = Path(ws) / "task.db"
+    if not db_path.exists():
+        return out
+
+    try:
+        with sqlite3.connect(str(db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT payload FROM audit_log "
+                "WHERE action='stage_advance' ORDER BY rowid DESC LIMIT 5"
+            ).fetchall()
+    except sqlite3.Error:
+        return out
+
+    for r in rows:
+        try:
+            payload = json.loads(r["payload"]) if r["payload"] else {}
+        except (json.JSONDecodeError, TypeError):
+            continue
+        new_tid = payload.get("new_task_id")
+        if new_tid and new_tid != task_id:
+            out["continuation_task_id"] = new_tid
+            break
+
+    return out
 
 
 def _empty_debug_artifacts(task_dir: Optional[Path] = None) -> Dict[str, Any]:
@@ -1346,14 +1426,26 @@ def _launch_retry_background(
         ),
     ]
     log_path.write_text(f"$ {' '.join(cmd)}\n", encoding="utf-8")
+    log_file_handle = open(log_path, "a", encoding="utf-8")  # BUG-5/10 fix
     proc = _sp.Popen(
         cmd,
         cwd=str(PROJECT_ROOT),
-        stdout=open(log_path, "a", encoding="utf-8"),
+        stdout=log_file_handle,
         stderr=_sp.STDOUT,
         env=env_extra,
         creationflags=0x00000008,
     )
+    # BUG-5 fix: 注册到全局表
+    _BG_PROCESSES[proc.pid] = {
+        "kind": "retry",
+        "pid": proc.pid,
+        "task_id": new_task_id,
+        "old_task_id": old_task_id,
+        "started_at": datetime.now().isoformat(),
+        "log_path": str(log_path.relative_to(PROJECT_ROOT)),
+        "_proc": proc,
+        "_log_handle": log_file_handle,  # BUG-10 fix
+    }
     return {
         "pid": proc.pid,
         "log_path": str(log_path.relative_to(PROJECT_ROOT)),
@@ -1749,13 +1841,25 @@ async def api_requirements_generate(payload: Dict[str, Any] = Body(default_facto
         elif gate == "stage5":
             cmd.append("--require-review-stage5")
     log_path.write_text(f"$ {cmd}\n", encoding="utf-8")
+    log_file_handle = open(log_path, "a", encoding="utf-8")  # BUG-4/10 fix
     proc = _sp.Popen(
         cmd,
         cwd=str(PROJECT_ROOT),
-        stdout=open(log_path, "a", encoding="utf-8"),
+        stdout=log_file_handle,
         stderr=_sp.STDOUT,
         creationflags=0x00000008,  # DETACHED_PROCESS on Windows
     )
+    # BUG-4 fix: 注册到全局表
+    _BG_PROCESSES[proc.pid] = {
+        "kind": "generate",
+        "pid": proc.pid,
+        "task_id": run_id,
+        "old_task_id": req_id,
+        "started_at": datetime.now().isoformat(),
+        "log_path": str(log_path.relative_to(PROJECT_ROOT)),
+        "_proc": proc,
+        "_log_handle": log_file_handle,
+    }
 
     return {
         "ok": True,

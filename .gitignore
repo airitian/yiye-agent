@@ -39,6 +39,9 @@ Thumbs.db
 .env.*
 *.env
 
+# 例外: .env.example 是模板, 必须 commit 让新用户能复制
+!.env.example
+
 # 任何包含 key/token/secret 的文件
 *.key
 *.token
@@ -146,3 +149,13 @@ ERR
 # 工作区任务数据库
 *.task.db
 task.db
+# ---- 与本项目无关的本地文件(误落到项目根目录的) ----
+# 第三方技能框架(superpowers-zh 等), 不是本项目的一部分
+.hermes/
+HERMES.md
+
+# 跨境选品脚本与抓取数据(属于另一条业务线)
+133.py
+alibaba_rfq_all.csv
+alibaba_rfq_all.json
+fastmoss_products_*.csv
